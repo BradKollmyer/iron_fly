@@ -57,6 +57,21 @@ Useful once the stack is up:
 make download-replay ARGS='--last 30'
 ```
 
+### Deploy to Lightsail
+
+Prerequisites: [AWS CLI](https://docs.aws.amazon.com/cli/), Docker, and
+[lightsailctl](https://lightsail.aws.amazon.com/ls/docs/en_us/articles/amazon-lightsail-install-software).
+
+```bash
+./scripts/deploy-lightsail.sh
+```
+
+The script pulls the newest `REPLAY_BOOTSTRAP_DAYS` (default 10) from the public
+R2 `manifest.json` into `replay/`, builds `iron-fly:public` for `linux/amd64`,
+pushes to a Lightsail container service (`iron-fly`, micro, scale 1), and prints
+the HTTPS URL. `SESSION_SECRET` is stored in `.lightsail-public.env` (not
+committed). Override the service name with `LIGHTSAIL_SERVICE=…` if needed.
+
 ### Using the desk
 
 1. Pick a **session date** on the Session Tape.

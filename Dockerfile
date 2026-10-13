@@ -12,6 +12,9 @@ COPY src ./src
 COPY config ./config
 RUN pip install --no-cache-dir .
 
+# Baked session tapes for Lightsail (local Docker still hydrates via entrypoint/volume).
+COPY replay ./replay
+
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh scripts/download-replay.py
 
