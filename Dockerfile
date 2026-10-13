@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 WORKDIR /app
 
-# git is required to pip-install iron-fly-strategy from GitHub @v0.1.0
+# git is required to pip-install iron-fly-strategy from GitHub @v0.1.1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
