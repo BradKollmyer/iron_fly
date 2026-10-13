@@ -1,4 +1,4 @@
-# iron_fly (public backtest)
+# Dale's IronFly Replay / Backtest Tool
 
 Docker-first **Dale's** SPX 0DTE iron-fly **backtest** desk and CLI.
 Inspired by [Dale's iron fly on YouTube](https://www.youtube.com/watch?v=kNR2r8Nj3qI).
