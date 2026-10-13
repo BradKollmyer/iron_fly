@@ -465,6 +465,9 @@ def open_strike(
     book = load_book(conn)
     if settings.desk_mode not in BOOK_FILLS and settings.desk_mode not in BACKTEST_MODES:
         return "live"
+    if any(fly.strike == float(strike) for fly in book.active()):
+        log.info("step %s fill open %s skipped already open", _clock_text(clock), int(strike))
+        return "duplicate"
     width = wings if wings in FLY_WIDTHS else load_wings(conn)
     if wings in FLY_WIDTHS and not engine["use_config"]:
         set_wings(conn, width)
@@ -702,11 +705,20 @@ def prepare_desk(conn: sqlite3.Connection, settings: Settings) -> None:
 
 
 def apply_spec(conn: sqlite3.Connection, spec: DeskSpec) -> None:
+    """Persist YAML and base regime/stop. Clear latch so the next frame/step uses the new file."""
     book = load_book(conn)
     book.regime = spec.regime
     book.stop_pad = spec.stop
     save_book(conn, book)
-    conn.execute("UPDATE desk_state SET spec_yaml = ? WHERE player_id = ?", (spec.yaml, _pid()))
+    conn.execute(
+        """
+        UPDATE desk_state
+        SET spec_yaml = ?, applied_at = NULL, regime_latch = NULL,
+            eff_wings = NULL, eff_regime = NULL, eff_stop = NULL, eff_f1 = NULL, eff_clock = NULL
+        WHERE player_id = ?
+        """,
+        (spec.yaml, _pid()),
+    )
 
 
 def set_policy(
@@ -800,7 +812,7 @@ def resolve_engine(
     switches = load_switches(conn)
     spec = _saved_spec(conn)
     book = load_book(conn)
-    regime = book.regime if book.regime in REGIME_MODES else "s1"
+    regime = book.regime if book.regime in REGIME_MODES else "s3"
     from iron_fly.strategy.rules import valid_stop_pad
 
     stop = book.stop_pad if valid_stop_pad(int(book.stop_pad)) else 0
@@ -876,7 +888,7 @@ def resolve_engine(
 
 def _ensure_state(conn: sqlite3.Connection) -> None:
     conn.execute(
-        "INSERT INTO desk_state (player_id, regime, stop_pad, use_config) VALUES (?, 's1', 0, 1) "
+        "INSERT INTO desk_state (player_id, regime, stop_pad, use_config) VALUES (?, 's3', 0, 1) "
         "ON CONFLICT(player_id) DO NOTHING",
         (_pid(),),
     )

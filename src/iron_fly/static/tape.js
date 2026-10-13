@@ -902,7 +902,9 @@
     if (!form || !form.getAttribute || !watch) return;
     const action = form.getAttribute("action") || "";
     if (action.indexOf("/desk/") !== 0) return;
+    // open-fly.js owns #open-fly Submit; ladder Add still posts here.
     if (action === "/desk/switches" || action === "/desk/policy" || action === "/desk/flatten" || action === "/desk/close") return;
+    if (action === "/desk/open" && form.closest("#open-fly")) return;
     event.preventDefault();
     postDesk(form);
   });

@@ -60,6 +60,7 @@ NOTICES = {
     "nomid": "No combo mid for that fly.",
     "missing": "That fly is not open.",
     "conflict": "That open would sell a contract already held long.",
+    "duplicate": "That strike is already open.",
     "nobid": "No bid to sell that leftover long.",
     "already closing": "That fly is already closing.",
 }
@@ -652,6 +653,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
         spec: str = Form(""),
         tape_day: str = Form(""),
+        at: str = Form(""),
         csrf: str = Form(""),
         conn: sqlite3.Connection = Depends(db_conn),
     ):
@@ -667,22 +669,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 chosen = ""
         if cfg.is_backtest and chosen:
             target = "/?date=" + chosen
+            if at:
+                target += "&at=" + at
         if cfg.desk_mode not in CONFIG_MODES:
             if wants_frame(request):
-                return action_frame(conn, tape_day, "", "config")
+                return action_frame(conn, tape_day, at, "config")
             return RedirectResponse(target, status_code=303)
         try:
             parsed = parse_spec(spec)
         except ValueError as exc:
             if wants_frame(request):
-                return action_frame(conn, tape_day, "", str(exc), applied=False)
+                return action_frame(conn, tape_day, at, str(exc), applied=False)
             request.session["spec_error"] = str(exc)
             request.session.pop("spec_applied", None)
             return RedirectResponse(target, status_code=303)
         apply_spec(conn, parsed)
         request.session.pop("spec_error", None)
         if wants_frame(request):
-            return action_frame(conn, tape_day, "", applied=True, spec_summary=parsed.summary())
+            return action_frame(conn, tape_day, at, applied=True, spec_summary=parsed.summary())
         request.session["spec_applied"] = True
         return RedirectResponse(target, status_code=303)
 
