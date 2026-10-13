@@ -1,0 +1,18 @@
+@import "tailwindcss";
+@source "../templates";
+@source "../static/tape.js";
+@source "../static/open-fly.js";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Manrope", "Inter", ui-sans-serif, system-ui, sans-serif;
+  --color-bg: #0b0f16;
+  --color-surface: #121826;
+  --color-line: #202a3b;
+  --color-ink: #eaf0f8;
+  --color-muted: #9aa7bc;
+  --color-faint: #5e6a80;
+  --color-accent: #8b9cf7;
+  --color-good: #3dd598;
+  --color-bad: #f0556b;
+}

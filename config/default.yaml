@@ -1,0 +1,23 @@
+f1_at: "10:40"              # open the first fly at this clock
+f1_below: 80                # AND below this EM%, open the first fly
+wings: 50                   # starting width; later steps can only narrow it
+regime: "±15/20"            # watch ±15, add at 20; credit regime cannot go wider
+stop: 0                     # drop at the credit breakeven (K ± credit)
+credit_regime: true         # after a 50-wide fill, the grid follows that credit
+cookies_below: 50           # under this EM%, switch to the tight cookies grid
+cookies_min_flies: 1        # cookies only while at least this many flies are open
+follow_wings: true          # from 9:35, width tracks the 0.40 put and never widens
+wing_steps: [50, 30, 20]    # widths follow_wings may snap to
+add_until: "15:58"          # no new fly from here; drops still run until 16:01
+#flatten_at: "15:49"        # flatten the wings at 15:00
+leftover_until: "15:45"     # stop sell/roll of parked wings; reopen can reuse them
+fill_mode_open: mid         # mid or bid (worst STO credit)
+fill_mode_close: mid        # mid or ask (worst BTC debit)
+picks:                      # a clock stays on; EM and EM% follow the reading
+  - at_em_pct: "65"         # EM% below 70
+    regime: "±7.5/10"       # change regime
+  - at_time: "15:00"        # from 15:00
+    stop: 1
+  - at_time: "15:50"        # from 15:00
+    stop: 2
+

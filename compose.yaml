@@ -1,0 +1,35 @@
+name: iron-fly-public
+
+services:
+  web:
+    build: .
+    image: iron-fly:public
+    ports:
+      - "${PORT:-8000}:8000"
+    env_file: .env
+    environment:
+      DESK_MODE: backtest-public
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8000}
+      REPLAY_CACHE: /app/replay
+      DATA_DIR: /data
+      R2_PUBLIC_BASE: ${R2_PUBLIC_BASE:-https://pub-2b55d3698db74832b9be7d007e3ef2be.r2.dev}
+      REPLAY_BOOTSTRAP_DAYS: ${REPLAY_BOOTSTRAP_DAYS:-10}
+      LISTEN_PORT: "8000"
+    volumes:
+      - replay:/app/replay
+      - data:/data
+
+  download:
+    image: iron-fly:public
+    profiles: ["tools"]
+    env_file: .env
+    environment:
+      REPLAY_CACHE: /app/replay
+      R2_PUBLIC_BASE: ${R2_PUBLIC_BASE:-https://pub-2b55d3698db74832b9be7d007e3ef2be.r2.dev}
+    volumes:
+      - replay:/app/replay
+    entrypoint: ["python", "scripts/download-replay.py"]
+
+volumes:
+  replay:
+  data:

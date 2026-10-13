@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0f16" />
+    <meta name="color-scheme" content="dark" />
+    <title>{% block title %}Captain's Log{% endblock %}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/app.css?v=row30" />
+  </head>
+  <body class="min-h-dvh bg-bg font-sans text-base text-ink antialiased pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
+    <div class="pointer-events-none fixed inset-0 overflow-hidden" aria-hidden="true">
+      <div class="absolute -right-[8vw] -top-[18vh] h-[60vh] w-[50vw] rounded-full bg-[radial-gradient(closest-side,rgba(94,110,248,0.16),transparent)] blur-3xl"></div>
+      <div class="absolute -bottom-[22vh] -left-[10vw] h-[55vh] w-[45vw] rounded-full bg-[radial-gradient(closest-side,rgba(156,85,236,0.10),transparent)] blur-3xl"></div>
+      <div class="absolute inset-0 bg-[radial-gradient(rgba(255,255,255,0.05)_1px,transparent_1px)] bg-[size:26px_26px]"></div>
+    </div>
+    <header class="relative z-10 flex flex-col gap-3 border-b border-line bg-bg/70 px-4 py-4 backdrop-blur-md md:flex-row md:items-center md:justify-between md:px-7">
+      <a href="/" class="flex items-center gap-3">
+        <span class="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent/15 font-display text-sm font-bold text-accent">IF</span>
+        <div class="leading-tight">
+          <b class="block font-display text-base font-semibold">Captain's Log</b>
+          <small class="text-sm text-muted">iron fly</small>
+        </div>
+      </a>
+    </header>
+    <main class="{% block main_class %}relative z-10 mx-auto w-full max-w-lg px-4 py-6 md:max-w-xl md:px-7 md:py-10{% endblock %}">
+      {% block body %}{% endblock %}
+    </main>
+  </body>
+</html>

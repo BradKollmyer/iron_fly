@@ -1,0 +1,59 @@
+[project]
+name = "iron-fly"
+version = "0.1.0"
+description = "Public Dale's iron fly backtest desk (Docker-first) with R2 replay hydrate."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "jinja2>=3.1",
+    "authlib>=1.4",
+    "cryptography>=44",
+    "python-multipart>=0.0.18",
+    "httpx>=0.28",
+    "httpx2>=2.0",
+    "pyyaml>=6.0",
+    "itsdangerous>=2.2",
+    "websockets>=13",
+    "iron-fly-strategy @ git+https://github.com/askosyrskiy/iron_fly_strategy.git@v0.1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "ruff>=0.8"]
+r2 = ["boto3>=1.35"]
+
+[project.scripts]
+iron-fly = "iron_fly.app:main"
+iron-fly-backtest = "iron_fly.backtest:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+iron_fly = ["templates/*.html", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# B008: FastAPI Depends() in defaults is idiomatic.
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B023"]
+"src/iron_fly/strategy/*.py" = ["F403", "F401"]
+
+[tool.ruff.format]
+quote-style = "double"
