@@ -22,6 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.3", "ruff>=0.8"]
 r2 = ["boto3>=1.35"]
+bake = ["psycopg[binary]>=3.2"]
 
 [project.scripts]
 iron-fly = "iron_fly.app:main"
