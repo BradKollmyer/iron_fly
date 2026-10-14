@@ -59,18 +59,68 @@ make download-replay ARGS='--last 30'
 
 ### Deploy to Lightsail
 
-Prerequisites: [AWS CLI](https://docs.aws.amazon.com/cli/), Docker, and
-[lightsailctl](https://lightsail.aws.amazon.com/ls/docs/en_us/articles/amazon-lightsail-install-software).
+Deploys the public desk to the smallest Amazon Lightsail **container service**
+(`iron-fly`, power `micro`, scale `1`). Lightsail terminates TLS and forwards
+HTTPS to HTTP port `8000` in the container.
+
+**Prerequisites**
+
+1. [AWS CLI](https://docs.aws.amazon.com/cli/) v2, logged in (`aws login` or
+   configured credentials) with permission to manage Lightsail container services
+   in your region (default `us-east-1`).
+2. [Docker](https://docs.docker.com/get-docker/) running locally (builds
+   `linux/amd64`).
+3. [lightsailctl](https://lightsail.aws.amazon.com/ls/docs/en_us/articles/amazon-lightsail-install-software)
+   on `PATH` (or `~/.local/bin`) so `aws lightsail push-container-image` works.
+4. A project venv with deps (the deploy script uses `.venv/bin/python` to sync
+   R2):
+
+```bash
+cp .env.example .env          # optional: set REPLAY_BOOTSTRAP_DAYS / R2_PUBLIC_BASE
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -e .
+```
+
+**Deploy**
 
 ```bash
 ./scripts/deploy-lightsail.sh
 ```
 
-The script pulls the newest `REPLAY_BOOTSTRAP_DAYS` (default 10) from the public
-R2 `manifest.json` into `replay/`, builds `iron-fly:public` for `linux/amd64`,
-pushes to a Lightsail container service (`iron-fly`, micro, scale 1), and prints
-the HTTPS URL. `SESSION_SECRET` is stored in `.lightsail-public.env` (not
-committed). Override the service name with `LIGHTSAIL_SERVICE=…` if needed.
+What the script does:
+
+1. Syncs the newest `REPLAY_BOOTSTRAP_DAYS` (default **10**) from the public R2
+   `manifest.json` into local `replay/` via `scripts/download-replay.py`.
+2. Fails if that sync cannot run and `replay/` has no `YYYY-MM-DD.json` files.
+3. Creates the Lightsail service if needed, builds `iron-fly:public`, pushes the
+   image, and creates a deployment with `REPLAY_HYDRATE=0` (tapes are baked in).
+4. Prints the public HTTPS URL when the deployment is `ACTIVE`.
+
+**Secrets**
+
+- Cookie signing uses `SESSION_SECRET` from `.lightsail-public.env` at the repo
+  root (gitignored). Format is a single line:
+
+  ```bash
+  SESSION_SECRET=<long random string>
+  ```
+
+- If the file is missing, the script generates a secret, writes the file
+  (`chmod 600`), and reuses it on later deploys so visitor sessions survive
+  redeploys. Do not commit this file.
+
+**Useful overrides**
+
+| Variable | Effect |
+|---|---|
+| `LIGHTSAIL_SERVICE` | Lightsail service name (default `iron-fly`) |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | Region (else AWS config, else `us-east-1`) |
+| `REPLAY_BOOTSTRAP_DAYS` | How many newest manifest days to sync/bake |
+| `R2_PUBLIC_BASE` | Public R2 base URL (or set in `.env`) |
+| `PYTHON` | Interpreter for sync/helpers (default `.venv/bin/python`) |
+
+Redeploy the same way after strategy or UI changes; each run refreshes the baked
+replay days from the current R2 manifest.
 
 ### Using the desk
 

@@ -18,6 +18,14 @@ LOCAL_IMAGE="iron-fly:public"
 SECRET_FILE="$ROOT/.lightsail-public.env"
 DEFAULT_R2_BASE="https://pub-2b55d3698db74832b9be7d007e3ef2be.r2.dev"
 
+if [[ -z "${PYTHON:-}" ]]; then
+  if [[ -x "$ROOT/.venv/bin/python" ]]; then
+    PYTHON="$ROOT/.venv/bin/python"
+  else
+    PYTHON="python3"
+  fi
+fi
+
 if ! command -v aws >/dev/null 2>&1; then
   echo "the aws CLI is not installed" >&2
   exit 1
@@ -75,8 +83,14 @@ R2_PUBLIC_BASE="${R2_PUBLIC_BASE%/}"
 export R2_PUBLIC_BASE
 export REPLAY_BOOTSTRAP_DAYS="$N"
 
+if ! "$PYTHON" -c 'import httpx' >/dev/null 2>&1; then
+  echo "Python at ${PYTHON} cannot import httpx (needed to sync R2)." >&2
+  echo "Run: python3.12 -m venv .venv && .venv/bin/pip install -e ." >&2
+  exit 1
+fi
+
 mkdir -p "$ROOT/replay"
-if ! python3 "$ROOT/scripts/download-replay.py" --last "$N"; then
+if ! "$PYTHON" "$ROOT/scripts/download-replay.py" --last "$N"; then
   echo "R2 sync failed; checking local replay/" >&2
 fi
 shopt -s nullglob
@@ -97,7 +111,7 @@ if [[ -f "$SECRET_FILE" ]]; then
   SESSION_SECRET="$(read_secret)"
 fi
 if [[ -z "${SESSION_SECRET:-}" ]]; then
-  SESSION_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+  SESSION_SECRET="$("$PYTHON" -c 'import secrets; print(secrets.token_urlsafe(32))')"
   umask 077
   printf 'SESSION_SECRET=%s\n' "$SESSION_SECRET" > "$SECRET_FILE"
   chmod 600 "$SECRET_FILE"
@@ -162,7 +176,7 @@ aws lightsail push-container-image \
   --service-name "$SERVICE" \
   --label "$LABEL" \
   --image "$LOCAL_IMAGE" >"$push_log"
-image="$(python3 - "$push_log" "$SERVICE" "$LABEL" <<'PY'
+image="$("$PYTHON" - "$push_log" "$SERVICE" "$LABEL" <<'PY'
 import json
 import re
 import sys
@@ -196,7 +210,7 @@ echo "pushed ${image}"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-python3 - "$image" "$url" "$SESSION_SECRET" "$R2_PUBLIC_BASE" "$N" "$tmp" <<'PY'
+"$PYTHON" - "$image" "$url" "$SESSION_SECRET" "$R2_PUBLIC_BASE" "$N" "$tmp" <<'PY'
 import json
 import sys
 
