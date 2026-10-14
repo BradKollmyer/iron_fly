@@ -9,14 +9,21 @@ export PYTHONPATH := src$(if $(PYTHONPATH),:$(PYTHONPATH),)
 REPLAY_BOOTSTRAP_DAYS ?= 10
 ARGS ?=
 
-.PHONY: help run-local run-ui run-docker download-replay backtest baketest backtest-docker \
-	test lint format build hydrate
+BAKE_DOCKER_CONTEXT ?= mac-mini
+BAKE_IMAGE ?= iron-fly-bake:local
+
+.PHONY: help run-local run-ui run-docker download-replay upload-replay bake bake-image bake-upload \
+	backtest baketest backtest-docker test lint format build hydrate
 
 help:
 	@echo "run-local          hydrate last $(REPLAY_BOOTSTRAP_DAYS) + serve http://localhost:\$$LISTEN_PORT"
 	@echo "run-docker         docker compose up --build"
 	@echo "hydrate            download last $(REPLAY_BOOTSTRAP_DAYS) days from R2"
 	@echo "download-replay    ARGS='--last 30' (or --from/--to/--all)"
+	@echo "upload-replay      gzip local replay/ → R2 (needs R2_* write keys + pip install '.[r2]')"
+	@echo "bake-image         build $(BAKE_IMAGE) on Docker context $(BAKE_DOCKER_CONTEXT)"
+	@echo "bake               remote bake on mini data network; docker cp JSON home"
+	@echo "bake-upload        bake then upload-replay"
 	@echo "backtest           ARGS='config/default.yaml --last 10'  (host Python)"
 	@echo "backtest-docker    same ARGS, inside Docker (hydrates R2 into the replay volume)"
 	@echo "lint / format / test / build"
@@ -35,6 +42,17 @@ run-docker:
 
 download-replay:
 	$(PYTHON) scripts/download-replay.py $(ARGS)
+
+upload-replay:
+	$(PYTHON) scripts/upload-replay-r2.py $(ARGS)
+
+bake-image:
+	docker --context $(BAKE_DOCKER_CONTEXT) build -f Dockerfile.bake -t $(BAKE_IMAGE) .
+
+bake:
+	$(PYTHON) scripts/bake-replay.py
+
+bake-upload: bake upload-replay
 
 # Local Python and Docker share this CLI. Example:
 #   make backtest ARGS='config/default.yaml --last 10'

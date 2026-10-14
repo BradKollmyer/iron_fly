@@ -1,0 +1,8 @@
+# One-shot bake worker for the mini `data` network (psycopg → postgres, HTTP → collector).
+FROM python:3.12-slim
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY scripts/bake-replay.py ./scripts/bake-replay.py
+RUN pip install --no-cache-dir ".[bake]"
+ENTRYPOINT ["python", "scripts/bake-replay.py"]

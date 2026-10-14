@@ -132,6 +132,23 @@ replay days from the current R2 manifest.
 
 ![Session tape with add/drop levels](docs/media/session-tape.png)
 
+## Bake + upload (private)
+
+Session tapes are produced from the mini collector/Postgres network, then
+gzipped to Cloudflare R2. The public desk only **downloads** from R2.
+
+```bash
+pip install -e ".[bake,r2]"
+# set MARKET_STREAMER_URL, BAKE_DATABASE_URL, and R2_* write keys in .env
+make bake-image   # once (or when bake code changes)
+make bake         # missing days → replay/YYYY-MM-DD.json
+make upload-replay ARGS='--last 5'
+# or: make bake-upload
+```
+
+Write credentials stay in local `.env` (never commit them). Readers use
+`R2_PUBLIC_BASE` only.
+
 ## Backtest CLI
 
 ### Host Python
