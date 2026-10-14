@@ -78,6 +78,9 @@ BACKTEST_MODES = frozenset(MODES)
 OWNER_PLAYER = "owner"
 _player: contextvars.ContextVar[str] = contextvars.ContextVar("iron_fly_player", default=OWNER_PLAYER)
 FLY_WIDTHS = (50, 40, 30, 25, 20)
+# Penny placeholder used when combo mid was missing; refuse that STO so backtest
+# does not open/close-churn at K ± 0.01.
+MIN_OPEN_CREDIT = 0.01
 _CHAIN_CACHE: dict[tuple[str, int], object] = {}
 _SPX_AT: dict[str, dict[int, dict]] = {}
 _RESIDENT: list[str] = []
@@ -484,6 +487,13 @@ def open_strike(
         if rejected:
             return rejected
         credit = _straddle_credit(fill, chain, strike)
+        if credit is None or float(credit) <= MIN_OPEN_CREDIT:
+            log.info(
+                "step %s fill open %s skipped no straddle credit for reused longs",
+                _clock_text(clock),
+                int(strike),
+            )
+            return "nomid"
         consume_wing_lots(conn, reused)
         book.open_fly(strike, round(float(credit), 2), width, clock)
         save_book(conn, book)
@@ -500,8 +510,18 @@ def open_strike(
         return rejected
     open_mode, _ = _fill_modes(conn)
     credit = _book_package_price(fill, credit, chain, strike, width, side="open", mode=open_mode)
-    if credit is None:
-        if fill is None:
+    if credit is None or float(credit) <= MIN_OPEN_CREDIT:
+        if (
+            settings.desk_mode in BACKTEST_MODES
+            or fill is None
+            or abs(float(fill)) <= MIN_OPEN_CREDIT
+        ):
+            log.warning(
+                "step %s fill open %s deferred no quotes %s (retry)",
+                _clock_text(clock),
+                int(strike),
+                leg_book(chain, strike, width),
+            )
             return "nomid"
         # Live order already accepted — never leave the blotter empty.
         log.error(
@@ -510,7 +530,7 @@ def open_strike(
             int(strike),
             fill,
         )
-        credit = abs(float(fill)) if float(fill) != 0 else 0.01
+        credit = abs(float(fill))
     book.open_fly(strike, round(float(credit), 2), width, clock)
     save_book(conn, book)
     log.info(
@@ -628,14 +648,20 @@ def _close_open_fly(conn, settings: Settings, book: FlyBook, fly, chain, clock: 
             return rejected
         _, close_mode = _fill_modes(conn)
         debit = _book_package_price(fill, None, chain, fly.strike, fly.wings, side="close", mode=close_mode)
-        if debit is None:
+        if debit is None or float(debit) <= MIN_OPEN_CREDIT:
+            if (
+                settings.desk_mode in BACKTEST_MODES
+                or fill is None
+                or abs(float(fill)) <= MIN_OPEN_CREDIT
+            ):
+                return "nomid"
             log.error(
                 "step %s fill drop %s booked without mid after live fill=%s",
                 _clock_text(clock),
                 int(fly.strike),
                 fill,
             )
-            debit = abs(float(fill)) if fill is not None and float(fill) != 0 else float(fly.credit)
+            debit = abs(float(fill))
     book.close_fly(fly.strike, debit, clock)
     save_book(conn, book)
     return None
@@ -1687,12 +1713,46 @@ def _fill_intent(
             log.info("step %s fill open %s skipped %s", clock, int(strike), fought)
             return False
         reused = reusable_wing_lots(conn, chain, strike, width)
+        # Backtest books the chain mid. Refuse (and retry next tick) until every
+        # leg is quoted — never STO at the 0.01 penny placeholder.
+        if settings.desk_mode in BACKTEST_MODES:
+            mark = _sim_open_credit(conn, chain, strike, width, reused=reused is not None)
+            if mark is None:
+                log.warning(
+                    "step %s fill open %s deferred no quotes %s (retry)",
+                    clock,
+                    int(strike),
+                    leg_book(chain, strike, width),
+                )
+                return False
+            if reused is not None:
+                consume_wing_lots(conn, reused)
+            intent.payload["credit"] = mark
+            intent.payload["wings"] = width
+            strategy.apply_intent(intent, ts)
+            log.info(
+                "step %s fill open %s credit=%.2f wings=%s %s%s",
+                clock,
+                int(strike),
+                mark,
+                width,
+                leg_book(chain, strike, width),
+                " reused longs" if reused is not None else "",
+            )
+            return True
         if reused is not None:
             rejected, fill = _send_open_shorts(settings, conn, chain, strike)
             if rejected:
                 log.info("step %s fill open %s rejected %s", clock, int(strike), rejected)
                 return False
             mark = _straddle_credit(fill, chain, strike)
+            if mark is None:
+                log.warning(
+                    "step %s fill open %s deferred no straddle credit for reused longs",
+                    clock,
+                    int(strike),
+                )
+                return False
             consume_wing_lots(conn, reused)
             intent.payload["credit"] = mark
             intent.payload["wings"] = width
@@ -1711,9 +1771,23 @@ def _fill_intent(
             return False
         open_mode, _ = _fill_modes(conn)
         mark = _book_package_price(fill, None, chain, strike, width, side="open", mode=open_mode)
-        if mark is None:
-            log.error("step %s fill open %s booked without mid after live fill=%s", clock, int(strike), fill)
-            mark = abs(float(fill)) if fill is not None and float(fill) != 0 else 0.01
+        if mark is None or float(mark) <= MIN_OPEN_CREDIT:
+            if fill is not None and abs(float(fill)) > MIN_OPEN_CREDIT:
+                log.error(
+                    "step %s fill open %s booked without mid after live fill=%s",
+                    clock,
+                    int(strike),
+                    fill,
+                )
+                mark = abs(float(fill))
+            else:
+                log.warning(
+                    "step %s fill open %s deferred no fill after live order fill=%s",
+                    clock,
+                    int(strike),
+                    fill,
+                )
+                return False
         intent.payload["credit"] = mark
         intent.payload["wings"] = width
         strategy.apply_intent(intent, ts)
@@ -1751,9 +1825,23 @@ def _fill_intent(
                 return False
             _, close_mode = _fill_modes(conn)
             mark = _book_package_price(fill, None, chain, strike, width, side="close", mode=close_mode)
-            if mark is None:
-                log.error("step %s fill drop %s booked without mid after live fill=%s", clock, int(strike), fill)
-                mark = abs(float(fill)) if fill is not None and float(fill) != 0 else 0.01
+            if mark is None or float(mark) <= MIN_OPEN_CREDIT:
+                if fill is not None and abs(float(fill)) > MIN_OPEN_CREDIT:
+                    log.error(
+                        "step %s fill drop %s booked without mid after live fill=%s",
+                        clock,
+                        int(strike),
+                        fill,
+                    )
+                    mark = abs(float(fill))
+                else:
+                    log.info(
+                        "step %s fill drop %s skipped no chain mid wings=%s",
+                        clock,
+                        int(strike),
+                        width,
+                    )
+                    return False
         intent.payload["debit"] = mark
         intent.payload["wings"] = width
         strategy.apply_intent(intent, ts)
@@ -1796,16 +1884,34 @@ def _leftover_auto(conn: sqlite3.Connection) -> dict[str, object] | None:
     return None if spec is None else spec.auto
 
 
-def _straddle_credit(fill: float | None, chain, strike: float) -> float:
-    """Raw short-straddle credit for a reused-wing open."""
+def _straddle_credit(fill: float | None, chain, strike: float) -> float | None:
+    """Raw short-straddle credit for a reused-wing open. None when unquoted."""
     if fill is not None:
         value = abs(float(fill))
-        if 0 < value <= 1000:
+        if value > MIN_OPEN_CREDIT and value <= 1000:
             return value
     mark = short_mark(chain, strike)
-    if mark is not None and 0 < mark <= 1000:
+    if mark is not None and mark > MIN_OPEN_CREDIT and mark <= 1000:
         return float(mark)
-    return 0.01
+    return None
+
+
+def _sim_open_credit(
+    conn: sqlite3.Connection,
+    chain,
+    strike: float,
+    width: int,
+    *,
+    reused: bool,
+) -> float | None:
+    """Chain credit for a backtest open. None until every needed leg is quoted."""
+    if reused:
+        return _straddle_credit(None, chain, strike)
+    open_mode, _ = _fill_modes(conn)
+    mark = _book_package_price(None, None, chain, strike, width, side="open", mode=open_mode)
+    if mark is None or float(mark) <= MIN_OPEN_CREDIT:
+        return None
+    return float(mark)
 
 
 def _send_open_shorts(
