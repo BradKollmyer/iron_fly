@@ -2,11 +2,15 @@
 """Write replay/YYYY-MM-DD.json for the image bake.
 
 Laptop driver: skip dense local days, bake missing ones inside a one-shot
-container on the mini Docker network `data` (psycopg → postgres, HTTP →
-collector), then `docker cp` only the finished JSON home.
+container on the mini Docker network "data" (psycopg → postgres, HTTP →
+collector), then docker-cp only the finished JSON home.
 
-Worker (`--worker`): SPX via `day_spx_tape`, chains from `BAKE_DATABASE_URL`.
+Worker (--worker): SPX via day_spx_tape, chains from BAKE_DATABASE_URL.
 Nothing here is imported by the public desk.
+
+Run with Python (not sh):  python scripts/bake-replay.py
+Or:  make bake
+Optional host days:  make bake ARGS='--days 2026-10-14'
 """
 
 from __future__ import annotations
@@ -57,15 +61,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", action="store_true", help="bake inside the container on network data")
     parser.add_argument("--out", type=Path, default=None, help="output directory (worker default /out)")
-    parser.add_argument("--days", nargs="+", default=[], help="YYYY-MM-DD to bake (worker; host uses streamer days)")
+    parser.add_argument(
+        "--days",
+        nargs="+",
+        default=[],
+        help="YYYY-MM-DD to bake (host: override streamer day list; worker: required)",
+    )
     args = parser.parse_args(argv)
     sys.path.insert(0, str(ROOT / "src"))
     if args.worker:
         return _worker_main(args.out or Path("/out"), args.days)
-    return _host_main()
+    return _host_main(args.days)
 
 
-def _host_main() -> int:
+def _host_main(day_texts: list[str] | None = None) -> int:
     from iron_fly.quotes.collector import CollectorClient
     from iron_fly.quotes.replay import (
         _CACHE_VERSION,
@@ -74,10 +83,9 @@ def _host_main() -> int:
         tape_keeps_each_second,
     )
 
-    url = os.environ.get("MARKET_STREAMER_URL", "").strip()
-    if not url:
-        print("MARKET_STREAMER_URL is not set", file=sys.stderr)
-        return 1
+    # Host only needs BAKE_DATABASE_URL (passed into the worker). SPX tape is fetched
+    # inside the container via collector on network "data". MARKET_STREAMER_URL on the
+    # laptop is only for discovering session days when --days is omitted.
     dsn = os.environ.get("BAKE_DATABASE_URL", "").strip()
     if not dsn:
         print("BAKE_DATABASE_URL is not set (postgres on the mini data network)", file=sys.stderr)
@@ -85,20 +93,32 @@ def _host_main() -> int:
     token = os.environ.get("MARKET_STREAMER_TOKEN", "").strip()
     dest = ROOT / "replay"
     dest.mkdir(parents=True, exist_ok=True)
-    client = CollectorClient(url, token)
-    days = client.session_days()
-    if KEEP > 0:
-        days = days[-KEEP:]
+    if day_texts:
+        days = list(day_texts)
+    else:
+        url = os.environ.get("MARKET_STREAMER_URL", "").strip()
+        if not url:
+            print(
+                "MARKET_STREAMER_URL is not set (needed to list session days; "
+                "or pass --days YYYY-MM-DD)",
+                file=sys.stderr,
+            )
+            return 1
+        days = CollectorClient(url, token).session_days()
+        if KEEP > 0:
+            days = days[-KEEP:]
     if not days:
         print("no session days", file=sys.stderr)
         return 1
     print(f"days {days[0]} .. {days[-1]} ({len(days)})")
-    keep = set(days)
-    for path in sorted(dest.glob("????-??-??.json")):
-        if path.stem in keep:
-            continue
-        path.unlink()
-        print(f"drop {path.stem}")
+    # Only prune local cache when baking the streamer window, not a one-off --days list.
+    if not day_texts:
+        keep = set(days)
+        for path in sorted(dest.glob("????-??-??.json")):
+            if path.stem in keep:
+                continue
+            path.unlink()
+            print(f"drop {path.stem}")
     missing: list[str] = []
     for item in days:
         path = dest / f"{item}.json"

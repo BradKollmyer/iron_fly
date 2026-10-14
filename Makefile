@@ -22,7 +22,7 @@ help:
 	@echo "download-replay    ARGS='--last 30' (or --from/--to/--all)"
 	@echo "upload-replay      gzip local replay/ → R2 (needs R2_* write keys + pip install '.[r2]')"
 	@echo "bake-image         build $(BAKE_IMAGE) on Docker context $(BAKE_DOCKER_CONTEXT)"
-	@echo "bake               remote bake on mini data network; docker cp JSON home"
+	@echo "bake               remote bake on mini data network; docker cp JSON home (ARGS='--days YYYY-MM-DD')"
 	@echo "bake-upload        bake then upload-replay"
 	@echo "backtest           ARGS='config/default.yaml --last 10'  (host Python)"
 	@echo "backtest-docker    same ARGS, inside Docker (hydrates R2 into the replay volume)"
@@ -50,7 +50,7 @@ bake-image:
 	docker --context $(BAKE_DOCKER_CONTEXT) build -f Dockerfile.bake -t $(BAKE_IMAGE) .
 
 bake:
-	$(PYTHON) scripts/bake-replay.py
+	$(PYTHON) scripts/bake-replay.py $(ARGS)
 
 bake-upload: bake upload-replay
 
