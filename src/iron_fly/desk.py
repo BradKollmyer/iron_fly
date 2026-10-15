@@ -39,7 +39,7 @@ from iron_fly.quotes.replay import (
 )
 from iron_fly.quotes.symbols import spxw_symbol
 from iron_fly.strategy.book import FlyBook
-from iron_fly.strategy.config_state import ConfigState, apply_config_state, pick_is_on
+from iron_fly.strategy.config_state import ConfigState, apply_config_state, pick_is_on, slippage_now
 from iron_fly.strategy.dale_og import DaleOg
 from iron_fly.strategy.rules import (
     REGIME_LABELS,
@@ -486,7 +486,7 @@ def open_strike(
         rejected, fill = _send_open_shorts(settings, conn, chain, strike)
         if rejected:
             return rejected
-        credit = _straddle_credit(fill, chain, strike)
+        credit = _subtract_open_slippage(conn, clock, _straddle_credit(fill, chain, strike))
         if credit is None or float(credit) <= MIN_OPEN_CREDIT:
             log.info(
                 "step %s fill open %s skipped no straddle credit for reused longs",
@@ -509,7 +509,9 @@ def open_strike(
     if rejected:
         return rejected
     open_mode, _ = _fill_modes(conn)
-    credit = _book_package_price(fill, credit, chain, strike, width, side="open", mode=open_mode)
+    credit = _subtract_open_slippage(
+        conn, clock, _book_package_price(fill, credit, chain, strike, width, side="open", mode=open_mode)
+    )
     if credit is None or float(credit) <= MIN_OPEN_CREDIT:
         if (
             settings.desk_mode in BACKTEST_MODES
@@ -541,6 +543,42 @@ def open_strike(
         width,
     )
     return None
+
+
+def _add_close_slippage(conn: sqlite3.Connection, when: datetime, debit: float | None) -> float | None:
+    """Add the active config slippage to a backtest close debit."""
+    if debit is None:
+        return None
+    pad = _active_slippage(conn, when)
+    if pad <= 0:
+        return float(debit)
+    return round(float(debit) + pad, 2)
+
+
+def _subtract_open_slippage(conn: sqlite3.Connection, when: datetime, credit: float | None) -> float | None:
+    """Take the active config slippage off a backtest open credit. None when nothing is left to sell."""
+    if credit is None:
+        return None
+    pad = _active_slippage(conn, when)
+    if pad <= 0:
+        return float(credit)
+    slipped = round(float(credit) - pad, 2)
+    if slipped <= MIN_OPEN_CREDIT:
+        return None
+    return slipped
+
+
+def _active_slippage(conn: sqlite3.Connection, when: datetime) -> float:
+    spec = _saved_spec(conn)
+    if spec is None:
+        return 0.0
+    row = conn.execute(
+        "SELECT em_pct, em_now FROM desk_state WHERE player_id = ?",
+        (_pid(),),
+    ).fetchone()
+    em_pct = None if row is None or row["em_pct"] is None else float(row["em_pct"])
+    em_now = None if row is None or row["em_now"] is None else float(row["em_now"])
+    return slippage_now(spec, wall=book_clock(when), em_pct=em_pct, em_now=em_now)
 
 
 def _book_package_price(
@@ -662,6 +700,7 @@ def _close_open_fly(conn, settings: Settings, book: FlyBook, fly, chain, clock: 
                 fill,
             )
             debit = abs(float(fill))
+    debit = _add_close_slippage(conn, clock, debit)
     book.close_fly(fly.strike, debit, clock)
     save_book(conn, book)
     return None
@@ -1716,7 +1755,9 @@ def _fill_intent(
         # Backtest books the chain mid. Refuse (and retry next tick) until every
         # leg is quoted — never STO at the 0.01 penny placeholder.
         if settings.desk_mode in BACKTEST_MODES:
-            mark = _sim_open_credit(conn, chain, strike, width, reused=reused is not None)
+            mark = _subtract_open_slippage(
+                conn, ts, _sim_open_credit(conn, chain, strike, width, reused=reused is not None)
+            )
             if mark is None:
                 log.warning(
                     "step %s fill open %s deferred no quotes %s (retry)",
@@ -1842,6 +1883,7 @@ def _fill_intent(
                         width,
                     )
                     return False
+        mark = _add_close_slippage(conn, ts, mark)
         intent.payload["debit"] = mark
         intent.payload["wings"] = width
         strategy.apply_intent(intent, ts)
