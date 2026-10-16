@@ -93,3 +93,28 @@ def test_backtest_open_subtracts_the_active_slippage(tmp_path):
     opened = [fly for fly in strategy.book.flies if fly.strike == 7700]
     assert float(opened[0].credit) == round(float(raw) - 1.1, 2)
     conn.close()
+
+
+def test_backtest_fee_is_one_dollar_on_each_of_four_legs(tmp_path):
+    settings = Settings.from_values(
+        app_base_url="http://localhost:8000",
+        session_secret="test-session-secret",
+        secrets_key=Fernet.generate_key().decode(),
+        data_dir=tmp_path,
+        desk_mode="backtest-public",
+    )
+    conn = connect(settings.db_path)
+    migrate(conn)
+    apply_spec(conn, parse_spec("fee_per_contract: 1\nfill_mode_close: ask\n"))
+    chain = _chain()
+    strategy = DaleOg()
+    raw = combo_fill(chain, 7700, 50, side="open", mode="mid")
+    when = datetime(2026, 10, 14, 10, 50, tzinfo=ET)
+    opened = Intent(IntentKind.ADD, "watch tagged", {"strike": 7700.0, "wings": 50})
+    assert _fill_intent(conn, settings, when.date(), strategy, opened, when, 50, chain) is True
+    assert float(opened.payload["credit"]) == round(float(raw) - 0.04, 2)
+    ask = combo_fill(chain, 7700, 50, side="close", mode="ask")
+    closed = Intent(IntentKind.CLOSE, "stop", {"strike": 7700.0, "wings": 50})
+    assert _fill_intent(conn, settings, when.date(), strategy, closed, when, 50, chain) is True
+    assert float(closed.payload["debit"]) == round(float(ask) + 0.04, 2)
+    conn.close()

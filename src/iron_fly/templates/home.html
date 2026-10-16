@@ -274,7 +274,7 @@
       <div>
         <p class="text-xs uppercase tracking-wide text-muted">Width</p>
         <div id="fly-widths" class="flex gap-1">
-          {% for width in (50, 40, 30, 25, 20) %}
+          {% for width in (50, 40, 30, 25, 20, 15, 10) %}
           <button type="button" data-width="{{ width }}" class="h-8 rounded-lg border px-2 text-sm tabular-nums {% if width == model.wing_choice %}border-accent bg-accent/15 text-accent{% else %}border-line bg-bg text-ink{% endif %}" aria-pressed="{{ 'true' if width == model.wing_choice else 'false' }}">{{ width }}</button>
           {% endfor %}
         </div>
@@ -328,7 +328,7 @@
           <label class="flex items-center gap-1.5 text-xs text-muted">
             Wings
             <select name="wings" class="h-8 rounded-lg border border-line bg-bg px-2 text-sm text-ink disabled:opacity-50" aria-label="Wings" {% if model.use_config %}disabled{% endif %}>
-              {% for width in (50, 40, 30, 25, 20) %}
+              {% for width in (50, 40, 30, 25, 20, 15, 10) %}
               <option value="{{ width }}"{% if model.wing_choice == width %} selected{% endif %}>{{ width }}</option>
               {% endfor %}
             </select>

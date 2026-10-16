@@ -77,7 +77,7 @@ _SESSION_DAY = ""
 BACKTEST_MODES = frozenset(MODES)
 OWNER_PLAYER = "owner"
 _player: contextvars.ContextVar[str] = contextvars.ContextVar("iron_fly_player", default=OWNER_PLAYER)
-FLY_WIDTHS = (50, 40, 30, 25, 20)
+FLY_WIDTHS = (50, 40, 30, 25, 20, 15, 10)
 # Penny placeholder used when combo mid was missing; refuse that STO so backtest
 # does not open/close-churn at K ± 0.01.
 MIN_OPEN_CREDIT = 0.01
@@ -486,7 +486,7 @@ def open_strike(
         rejected, fill = _send_open_shorts(settings, conn, chain, strike)
         if rejected:
             return rejected
-        credit = _subtract_open_slippage(conn, clock, _straddle_credit(fill, chain, strike))
+        credit = _subtract_open_slippage(conn, clock, _straddle_credit(fill, chain, strike), _SHORT_LEGS)
         if credit is None or float(credit) <= MIN_OPEN_CREDIT:
             log.info(
                 "step %s fill open %s skipped no straddle credit for reused longs",
@@ -510,7 +510,10 @@ def open_strike(
         return rejected
     open_mode, _ = _fill_modes(conn)
     credit = _subtract_open_slippage(
-        conn, clock, _book_package_price(fill, credit, chain, strike, width, side="open", mode=open_mode)
+        conn,
+        clock,
+        _book_package_price(fill, credit, chain, strike, width, side="open", mode=open_mode),
+        _FLY_LEGS,
     )
     if credit is None or float(credit) <= MIN_OPEN_CREDIT:
         if (
@@ -545,27 +548,48 @@ def open_strike(
     return None
 
 
-def _add_close_slippage(conn: sqlite3.Connection, when: datetime, debit: float | None) -> float | None:
-    """Add the active config slippage to a backtest close debit."""
+_FLY_LEGS = 4
+_SHORT_LEGS = 2
+
+
+def _add_close_slippage(
+    conn: sqlite3.Connection, when: datetime, debit: float | None, contracts: int = _FLY_LEGS
+) -> float | None:
+    """Add config slippage and per-contract fees to a backtest close debit."""
     if debit is None:
         return None
-    pad = _active_slippage(conn, when)
-    if pad <= 0:
+    cost = _active_slippage(conn, when) + _fee_points(conn, contracts)
+    if cost <= 0:
         return float(debit)
-    return round(float(debit) + pad, 2)
+    return round(float(debit) + cost, 2)
 
 
-def _subtract_open_slippage(conn: sqlite3.Connection, when: datetime, credit: float | None) -> float | None:
-    """Take the active config slippage off a backtest open credit. None when nothing is left to sell."""
+def _subtract_open_slippage(
+    conn: sqlite3.Connection, when: datetime, credit: float | None, contracts: int = _FLY_LEGS
+) -> float | None:
+    """Take config slippage and per-contract fees off a backtest open credit."""
     if credit is None:
         return None
-    pad = _active_slippage(conn, when)
-    if pad <= 0:
+    cost = _active_slippage(conn, when) + _fee_points(conn, contracts)
+    if cost <= 0:
         return float(credit)
-    slipped = round(float(credit) - pad, 2)
+    slipped = round(float(credit) - cost, 2)
     if slipped <= MIN_OPEN_CREDIT:
         return None
     return slipped
+
+
+def _fee_points(conn: sqlite3.Connection, contracts: int) -> float:
+    """Dollar fee per contract, in option points. $1 on one contract is 0.01."""
+    if contracts <= 0:
+        return 0.0
+    spec = _saved_spec(conn)
+    if spec is None:
+        return 0.0
+    dollars = float(spec.fee_per_contract)
+    if dollars <= 0:
+        return 0.0
+    return contracts * dollars / 100.0
 
 
 def _active_slippage(conn: sqlite3.Connection, when: datetime) -> float:
@@ -669,6 +693,7 @@ def pause_auto_open(conn: sqlite3.Connection) -> None:
 def _close_open_fly(conn, settings: Settings, book: FlyBook, fly, chain, clock: datetime) -> str | None:
     """4-leg close, or BTC the shorts when a long wing is dead and park that wing."""
     notes = dead_wings(chain, fly.strike, fly.wings)
+    contracts = _SHORT_LEGS if notes else _FLY_LEGS
     if notes:
         debit = short_mark(chain, fly.strike)
         if debit is None:
@@ -700,7 +725,7 @@ def _close_open_fly(conn, settings: Settings, book: FlyBook, fly, chain, clock: 
                 fill,
             )
             debit = abs(float(fill))
-    debit = _add_close_slippage(conn, clock, debit)
+    debit = _add_close_slippage(conn, clock, debit, contracts)
     book.close_fly(fly.strike, debit, clock)
     save_book(conn, book)
     return None
@@ -1381,6 +1406,8 @@ def replay_until(conn: sqlite3.Connection, settings: Settings, day: date, until:
         return until
     marks = load_day_tape(settings, day)
     spec = _saved_spec(conn) if engine["use_config"] else None
+    # YAML is fixed for this walk. Parsing it again on every leftover second dominated the backtest.
+    leftover_rules = spec.auto if spec is not None else _leftover_auto(conn)
     book = FlyBook() if rebuild else saved
     if rebuild and spec is not None:
         book.regime = spec.regime
@@ -1435,7 +1462,7 @@ def replay_until(conn: sqlite3.Connection, settings: Settings, day: date, until:
             if engine["auto_open"]:
                 strategy.f1_at = state.f1_at
         clock = _clock_text(ts)
-        if leftover_long_rows(conn) and leftovers_sell_allowed(book_clock(ts), _leftover_auto(conn)):
+        if leftover_long_rows(conn) and leftovers_sell_allowed(book_clock(ts), leftover_rules):
             sold = sell_ready_leftovers(conn, settings, chain_asof(settings, day, ts))
             if sold:
                 log.info("step %s sold %s leftover longs", clock, sold)
@@ -1756,7 +1783,10 @@ def _fill_intent(
         # leg is quoted — never STO at the 0.01 penny placeholder.
         if settings.desk_mode in BACKTEST_MODES:
             mark = _subtract_open_slippage(
-                conn, ts, _sim_open_credit(conn, chain, strike, width, reused=reused is not None)
+                conn,
+                ts,
+                _sim_open_credit(conn, chain, strike, width, reused=reused is not None),
+                _SHORT_LEGS if reused is not None else _FLY_LEGS,
             )
             if mark is None:
                 log.warning(
@@ -1846,7 +1876,8 @@ def _fill_intent(
         if fly is None:
             return False
         width = fly.wings
-        if dead_wings(chain, strike, width):
+        contracts = _SHORT_LEGS if dead_wings(chain, strike, width) else _FLY_LEGS
+        if contracts == _SHORT_LEGS:
             mark = short_mark(chain, strike)
             if mark is None:
                 log.info("step %s fill drop %s skipped no chain mid wings=%s", clock, int(strike), width)
@@ -1883,7 +1914,7 @@ def _fill_intent(
                         width,
                     )
                     return False
-        mark = _add_close_slippage(conn, ts, mark)
+        mark = _add_close_slippage(conn, ts, mark, contracts)
         intent.payload["debit"] = mark
         intent.payload["wings"] = width
         strategy.apply_intent(intent, ts)
@@ -2180,11 +2211,31 @@ def _save_open(conn: sqlite3.Connection, day: str, opening: float | None, sample
 
 def _stamp_flies(data: dict, book: FlyBook, marks: DeskMarks, clock: datetime) -> None:
     rows = data.get("flies") or []
+    data["flies"] = rows
+    paired = [row for row in rows if row.get("status") != "empty"]
+    flies = list(book.flies)
+    while len(paired) < len(flies):
+        fly = flies[len(paired)]
+        row = {
+            "slot": len(paired) + 1,
+            "strike": fly.strike,
+            "status": "closed" if fly.status == "closed" else "active",
+            "put_wing": fly.wings,
+            "call_wing": fly.wings,
+            "sto": fly.credit,
+            "btc_actual": fly.close_debit,
+            "net": fly.net,
+            "origin": fly.origin,
+        }
+        rows.append(row)
+        paired.append(row)
+    if len(paired) > len(flies):
+        paired = paired[: len(flies)]
     pnl = 0.0
     seen = False
     cash = book_clock(clock) >= _CASH_AT
     close = _cash_close(marks) if cash else None
-    for row, fly in zip(rows, book.flies, strict=True):
+    for row, fly in zip(paired, flies):
         row["time_open"] = fly.opened_at.astimezone(_ET).strftime("%H:%M")
         if fly.closed_at is not None:
             row["time_close"] = fly.closed_at.astimezone(_ET).strftime("%H:%M")

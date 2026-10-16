@@ -19,6 +19,7 @@ import logging
 import os
 import sys
 import tempfile
+from bisect import bisect_right
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time
 from pathlib import Path
@@ -29,7 +30,7 @@ from cryptography.fernet import Fernet
 
 from iron_fly.config import Settings
 from iron_fly.db import connect, migrate
-from iron_fly.desk import apply_spec, load_day_tape, replay_until, set_switches, watch_frame
+from iron_fly.desk import apply_spec, current_player, load_day_tape, replay_until, set_switches, watch_frame
 from iron_fly.quotes.replay import baked_days
 from iron_fly.strategy.spec import parse_spec
 
@@ -41,6 +42,9 @@ class DayResult:
     day: date
     report: str
     pnl: float | None
+    em_open: float | None = None
+    em_at_open: float | None = None
+    em_pct: float | None = None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -115,13 +119,25 @@ def _walk(text: str, days: list[date], *, replay: Path | None = None):
                 )
                 frame = watch_frame(conn, settings, marks)
                 settled = marks.ts is not None and marks.ts.astimezone(_ET).time() >= time(16, 0)
+                opened = [
+                    datetime.fromisoformat(row["opened_at"])
+                    for row in conn.execute(
+                        "SELECT opened_at FROM fly WHERE player_id = ? ORDER BY id",
+                        (current_player(),),
+                    )
+                ]
             finally:
                 conn.close()
         pnl = frame.get("pnl")
+        em_open = _num(frame.get("em_open"))
+        first_em, first_pct = _reading_at(marks.tape, opened[0]) if opened else (None, None)
         yield DayResult(
             day,
-            _report(day, spec.summary(), frame, settled=settled),
+            _report(day, spec.summary(), frame, settled=settled, tape=marks.tape or [], opened=opened),
             float(pnl) if isinstance(pnl, (int, float)) else None,
+            em_open,
+            first_em,
+            first_pct,
         )
 
 
@@ -130,7 +146,11 @@ def _print_pnl(text: str, days: list[date], *, replay: Path | None) -> None:
     total = 0
     counted = False
     for item in _walk(text, days, replay=replay):
-        print(f"{item.day.isoformat():<12}{_money(item.pnl)}", flush=True)
+        print(
+            f"{item.day.isoformat():<12}{_money(item.pnl)}  "
+            f"open EM {_quote(item.em_open):>6}  em {_quote(item.em_at_open):>6}  em% {_quote(item.em_pct):>5}",
+            flush=True,
+        )
         amount = _dollar_amount(item.pnl)
         if amount is not None:
             total += amount
@@ -221,21 +241,62 @@ def _settings(data_dir: Path) -> Settings:
     )
 
 
-def _report(day: date, summary: str, frame: dict, *, settled: bool) -> str:
-    lines = [f"{day.isoformat()}  {summary}"]
+def _report(
+    day: date,
+    summary: str,
+    frame: dict,
+    *,
+    settled: bool,
+    tape: list | None = None,
+    opened: list[datetime] | None = None,
+) -> str:
+    lines = [f"{day.isoformat()}  {summary} · open EM {_quote(frame.get('em_open'))}"]
     flies = frame.get("flies") or []
     if not flies:
         lines.append("  no flies")
-    for fly in flies:
+    stamps = [int(point["time"]) for point in tape or []]
+    opens = opened or []
+    for index, fly in enumerate(flies):
         close = fly.get("time_close") or ("16:00" if settled and fly.get("status") == "active" else "open")
         strike = int(fly["strike"]) if fly.get("strike") is not None else "—"
         sto = "—" if fly.get("sto") is None else f"{float(fly['sto']):.2f}"
+        when = opens[index] if index < len(opens) else None
+        em, pct = _reading_at(tape or [], when, stamps)
         lines.append(
             f"  {fly.get('time_open') or '—':<5} {close:<5}  {strike}  wings {fly.get('wings')}  "
-            f"sto {sto}  pnl {_dollars(fly.get('pnl'))}"
+            f"sto {sto}  em {_quote(em):>6}  em% {_quote(pct):>5}  pnl {_dollars(fly.get('pnl'))}"
         )
     lines.append(f"P&L {_dollars(frame.get('pnl'))}")
     return "\n".join(lines)
+
+
+def _reading_at(
+    tape: list,
+    when: datetime | None,
+    stamps: list[int] | None = None,
+) -> tuple[float | None, float | None]:
+    """ATM straddle and EM% on the latest tape print at or before `when`."""
+    if when is None or not tape:
+        return None, None
+    stamps = stamps if stamps is not None else [int(point["time"]) for point in tape]
+    index = bisect_right(stamps, int(when.timestamp())) - 1
+    if index < 0:
+        return None, None
+    point = tape[index]
+    return _num(point.get("em")), _num(point.get("pct"))
+
+
+def _quote(value: object) -> str:
+    number = _num(value)
+    if number is None:
+        return "—"
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
+def _num(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 def _dollars(points: object) -> str:
