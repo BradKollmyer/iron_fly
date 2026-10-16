@@ -4,7 +4,7 @@ Docker-first **Dale's** SPX 0DTE iron-fly **backtest** desk and CLI.
 Inspired by [Dale's iron fly on YouTube](https://www.youtube.com/watch?v=kNR2r8Nj3qI).
 
 Strategy rules come from
-[`iron_fly_strategy@v0.1.1`](https://github.com/askosyrskiy/iron_fly_strategy).
+[`iron_fly_strategy@v0.1.5`](https://github.com/askosyrskiy/iron_fly_strategy).
 Session tapes are gzipped on Cloudflare R2 (~1.5 MB/day). Each day file stores
 **SPX prints every 1 second** and the **option chain every 2 seconds**.
 
@@ -26,7 +26,7 @@ Default configuration is `config/default.yaml` (paste/Apply in **Configuration**
 ```bash
 cp .env.example .env
 python3.12 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"   # pulls iron-fly-strategy@v0.1.1 from GitHub
+pip install -e ".[dev]"   # pulls iron-fly-strategy@v0.1.5 from GitHub
 
 make run-local            # hydrate last 10 days from R2, then serve
 # open http://localhost:8000
@@ -229,7 +229,7 @@ Copy and edit this file (or add siblings under `config/`) for different desks.
 |---|---|---|
 | `f1_at` | `HH:MM` or omit/empty | Earliest clock for the first fly. Omit → wait for a manual click (live desk). |
 | `f1_below` | number (EM%) | First fly also needs EM% **below** this. |
-| `wings` | `auto`, `50`, `40`, `30`, `25`, `20` | Starting wing width. Later rules may only **narrow**. `auto` follows the time-of-day ladder. |
+| `wings` | `auto`, `50`, `40`, `30`, `25`, `20`, `15`, `10` | Starting wing width. Later rules may only **narrow**. `auto` follows the time-of-day ladder. |
 | `regime` | see regimes below | Starting add/drop grid (watch / add spacing). |
 | `stop` | integer `0`–`20` | Extra points beyond credit breakeven (`K ± credit`). `0` = drop at breakeven. |
 | `picks` | list of overlays | Timed or EM-triggered changes to regime / stop / wings (see below). |
