@@ -1328,9 +1328,7 @@ def _regime_latch(conn: sqlite3.Connection) -> str | None:
 
 
 def _save_regime_latch(conn: sqlite3.Connection, name: str | None) -> None:
-    if not name:
-        return
-    conn.execute("UPDATE desk_state SET regime_latch = ? WHERE player_id = ?", (name, _pid()))
+    conn.execute("UPDATE desk_state SET regime_latch = ? WHERE player_id = ?", (name or None, _pid()))
 
 
 def _eff_wings(conn: sqlite3.Connection) -> str:
@@ -1457,7 +1455,7 @@ def replay_until(conn: sqlite3.Connection, settings: Settings, day: date, until:
                 em_low=em_low,
                 regime_latch=regime_latch,
             )
-            regime_latch = state.regime_latch or regime_latch
+            regime_latch = state.regime_latch or None
             width_choice = state.latest_wings or state.wings
             if engine["auto_open"]:
                 strategy.f1_at = state.f1_at

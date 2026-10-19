@@ -4,7 +4,7 @@ Docker-first **Dale's** SPX 0DTE iron-fly **backtest** desk and CLI.
 Inspired by [Dale's iron fly on YouTube](https://www.youtube.com/watch?v=kNR2r8Nj3qI).
 
 Strategy rules come from
-[`iron_fly_strategy@v0.1.5`](https://github.com/askosyrskiy/iron_fly_strategy).
+[`iron_fly_strategy@v0.1.6`](https://github.com/askosyrskiy/iron_fly_strategy).
 Session tapes are gzipped on Cloudflare R2 (~1.5 MB/day). Each day file stores
 **SPX prints every 1 second** and the **option chain every 2 seconds**.
 
@@ -26,7 +26,7 @@ Default configuration is `config/default.yaml` (paste/Apply in **Configuration**
 ```bash
 cp .env.example .env
 python3.12 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"   # pulls iron-fly-strategy@v0.1.5 from GitHub
+pip install -e ".[dev]"   # pulls iron-fly-strategy@v0.1.6 from GitHub
 
 make run-local            # hydrate last 10 days from R2, then serve
 # open http://localhost:8000
@@ -200,9 +200,10 @@ Shipped default (see the file for the live copy):
 f1_at: "10:40"              # open the first fly at this clock
 f1_below: 80                # AND below this EM%, open the first fly
 wings: 50                   # starting width; later steps can only narrow it
-regime: "±15/20"            # watch ±15, add at 20; credit regime cannot go wider
+regime: "±15/20"            # grid until EM is published
 stop: 0                     # drop at the credit breakeven (K ± credit)
-credit_regime: true         # after a 50-wide fill, the grid follows that credit
+em_regime: true             # current EM $ picks the row, and can widen again
+credit_regime: false        # the fill credit no longer sets the grid
 cookies_below: 50           # under this EM%, switch to the tight cookies grid
 cookies_min_flies: 1        # cookies only while at least this many flies are open
 follow_wings: true          # from 9:35, width tracks the 0.40 put and never widens
@@ -213,8 +214,6 @@ leftover_until: "15:45"     # stop sell/roll of parked wings; reopen can reuse t
 fill_mode_open: mid         # mid or bid (worst STO credit)
 fill_mode_close: mid        # mid or ask (worst BTC debit)
 picks:                      # a clock stays on; EM and EM% follow the reading
-  - at_em_pct: "65"         # EM% below 65
-    regime: "±7.5/10"       # change regime
   - at_time: "15:00"
     stop: 1
   - at_time: "15:50"
@@ -247,7 +246,7 @@ Written as labels or short codes (aliases accepted):
 | `±2.5/5` | `ladder` | Neighbor ladder (±2.5 / ±5) |
 | `cookies` | `cookies` | Tight cookies grid (±2.5 / ±5) |
 
-Wider → tighter is allowed when picks or credit-regime fire; the book does not widen again.
+Wider → tighter is allowed when picks or credit-regime fire; those choices do not widen again. `em_regime` is the exception: the current EM $ sets the row on every print, so the grid widens again when EM rises.
 
 ### Auto / session fields
 
@@ -255,7 +254,8 @@ These may sit at the top level (preferred) or under a legacy nested `auto:` bloc
 
 | Field | Values | Meaning |
 |---|---|---|
-| `credit_regime` | `true` / `false` | After a **50-wide** fill, snap the grid from that credit band (s1–s4). Cannot go wider than the desk `regime` / `regime_max`. |
+| `credit_regime` | `true` / `false` | After a **50-wide** fill, snap the grid from that credit band (s1–s4). Cannot go wider than the desk `regime` / `regime_max`. Ignored on a print where `em_regime` has a current EM $. |
+| `em_regime` | `true` / `false` | Current EM $ picks the same rows as the credit table, and the next print may widen. Under $15 → ±7.5/10, $15–$19 → ±10/15, under $24.90 → ±15/20, $24.90 and above → ±20/25. The desk `regime` cap does not apply. Before the open EM is published, the desk `regime` stays. |
 | `regime_max` | regime label/code | Cap how wide credit-regime may go. |
 | `cookies_below` | number (EM%) | Switch to cookies while EM% is under this. |
 | `cookies_min_flies` | whole number ≥ 0 | Cookies only if at least this many flies are open. |
