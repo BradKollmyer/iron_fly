@@ -10,10 +10,10 @@ from cryptography.fernet import Fernet
 
 from iron_fly.config import Settings
 from iron_fly.db import connect, migrate
-from iron_fly.desk import _fill_intent, load_book, open_strike
-from iron_fly.domain.market import ChainSnapshot, DeskMarks, StrikeQuote, combo_mark
+from iron_fly.desk import _fill_intent, _fill_modes, load_book, open_strike
+from iron_fly.domain.market import ChainSnapshot, DeskMarks, StrikeQuote, combo_fill
 from iron_fly.domain.models import Intent, IntentKind
-from iron_fly.orders import leftover_long_rows, park_lots, sell_ready_leftovers, short_mark
+from iron_fly.orders import event_rows, leftover_long_rows, park_lots, sell_ready_leftovers, short_mark
 from iron_fly.strategy.dale_og import DaleOg
 
 ET = ZoneInfo("America/New_York")
@@ -52,8 +52,11 @@ def test_backtest_refuses_open_without_combo_mid_then_retries(tmp_path, caplog):
         expiration=None,
         strikes=(
             _strike(7650, (0.2, 0.4), (0.4, 0.6)),
+            _strike(7670, (0.3, 0.5), (0.5, 0.7)),
             _strike(7700, (10, 12), (8, 10)),
+            _strike(7720, (9, 11), (7, 9)),
             _strike(7750, (0.4, 0.6), (0.3, 0.5)),
+            _strike(7770, (0.5, 0.7), (0.4, 0.6)),
         ),
     )
     when = datetime(2026, 10, 14, 10, 50, tzinfo=ET)
@@ -78,17 +81,19 @@ def test_backtest_refuses_open_without_combo_mid_then_retries(tmp_path, caplog):
     active = [fly for fly in strategy.book.flies if fly.status == "active"]
     assert [(fly.strike, fly.credit) for fly in active] == [(7750, 21.0)]
 
-    later = Intent(IntentKind.ADD, "watch tagged", {"strike": 7700.0, "wings": 50})
+    later = Intent(IntentKind.ADD, "watch tagged", {"strike": 7720.0, "wings": 50})
     assert (
         _fill_intent(
             conn, settings, date(2026, 10, 14), strategy, later, when.replace(second=5), 50, full
         )
         is True
     )
-    assert float(later.payload["credit"]) == combo_mark(full, 7700, 50)
-    opened = [fly for fly in strategy.book.flies if fly.strike == 7700 and fly.status == "active"]
+    open_mode, _close_mode = _fill_modes(conn)
+    expected = combo_fill(full, 7720, 50, side="open", mode=open_mode)
+    assert float(later.payload["credit"]) == expected
+    opened = [fly for fly in strategy.book.flies if fly.strike == 7720 and fly.status == "active"]
     assert len(opened) == 1
-    assert float(opened[0].credit) == combo_mark(full, 7700, 50)
+    assert float(opened[0].credit) == expected
     conn.close()
 
 
@@ -187,6 +192,52 @@ def test_add_stays_blocked_when_the_parked_long_has_no_bid(tmp_path):
     assert _fill_intent(conn, settings, date(2026, 10, 22), strategy, intent, when, 20, chain) is False
     assert [(row["right"], int(row["strike"])) for row in leftover_long_rows(conn)] == [("call", 7660)]
     assert strategy.book.active() == []
+    assert any(row["text"].startswith("Open blocked 7660 @ 20") for row in event_rows(conn))
+    conn.close()
+
+
+def test_add_logs_when_short_fights_an_open_fly_wing(tmp_path):
+    from iron_fly.orders import event_rows, load_open_conflict
+
+    chain = _wing_chain()
+    when = datetime(2026, 10, 22, 15, 50, 45, tzinfo=ET)
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    migrate(conn)
+    strategy = DaleOg()
+    strategy.book.open_fly(7640, 8.30, 20, when.replace(minute=46))
+    intent = Intent(IntentKind.ADD, "watch tagged", {"strike": 7660.0, "wings": 20})
+    assert _fill_intent(conn, settings, date(2026, 10, 22), strategy, intent, when, 20, chain) is False
+    assert len(strategy.book.active()) == 1
+    banner = load_open_conflict(conn)
+    assert banner is not None
+    assert banner.startswith("Open blocked 7660 @ 20")
+    assert "short 7660 call" in banner
+    assert any(row["text"] == banner for row in event_rows(conn))
+    conn.close()
+
+
+def test_open_blocked_suggests_wider_wings_when_that_clears_the_book(tmp_path):
+    from iron_fly.orders import load_open_conflict, open_book_hold, record_open_blocked
+
+    when = datetime(2026, 10, 22, 15, 50, tzinfo=ET)
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    migrate(conn)
+    strategy = DaleOg()
+    strategy.book.open_fly(7700, 12.0, 25, when)
+    assert open_book_hold(strategy.book.active(), 7680, 20) is not None
+    assert open_book_hold(strategy.book.active(), 7680, 25) is None
+    text = record_open_blocked(
+        conn,
+        when,
+        7680,
+        20,
+        open_book_hold(strategy.book.active(), 7680, 20) or "",
+        strategy.book.active(),
+    )
+    assert "Try width 25" in text
+    assert load_open_conflict(conn) == text
     conn.close()
 
 

@@ -304,6 +304,7 @@
         <button type="submit" id="fly-submit" class="desk-order h-8 rounded-full bg-accent px-3 text-sm font-medium text-bg disabled:opacity-40" data-kind="open" data-blocked="{{ '1' if model.block_open else '0' }}" {% if model.block_open %}disabled{% endif %}>Submit</button>
       </div>
       <p id="fly-note" class="basis-full text-xs text-muted"></p>
+      <p id="open-conflict" class="basis-full text-sm text-bad{% if not model.open_conflict %} hidden{% endif %}">{{ model.open_conflict or "" }}</p>
     </form>
   </article>
   <script id="chain-data" type="application/json">{{ model.chain_json | default('{}', true) }}</script>

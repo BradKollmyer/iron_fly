@@ -22,6 +22,8 @@ log = logging.getLogger("iron_fly.step")
 
 DEAD_LONG_MARK = 0.05
 HOLD_CONFLICT = "Same contract cannot stay long and short."
+OPEN_BLOCKED_PREFIX = "Open blocked"
+SUGGEST_OPEN_WINGS = 25
 ROLL_ABOVE = 0.50
 ROLL_TARGET = 0.40
 
@@ -326,6 +328,72 @@ def _conflicting_lots(conn: sqlite3.Connection, chain: ChainSnapshot | None, str
         seen.add(ident)
         hits.append(lot)
     return hits
+
+
+def open_book_hold(active, strike: float, wings: int) -> str | None:
+    """Refuse when a new fly would short an open fly's wing or long a body short."""
+    body = int(round(strike))
+    put_wing = int(round(strike - wings))
+    call_wing = int(round(strike + wings))
+    parts: list[str] = []
+    for fly in active:
+        center = int(round(fly.strike))
+        span = int(fly.wings)
+        if body == center - span:
+            parts.append(f"short {body} put vs long put on {center}/{span}")
+        if body == center + span:
+            parts.append(f"short {body} call vs long call on {center}/{span}")
+        if put_wing == center:
+            parts.append(f"long put {put_wing} vs short put on {center}")
+        if call_wing == center:
+            parts.append(f"long call {call_wing} vs short call on {center}")
+    if not parts:
+        return None
+    return "; ".join(parts) + ". " + HOLD_CONFLICT
+
+
+def clear_open_conflict(conn: sqlite3.Connection) -> None:
+    conn.execute("UPDATE desk_state SET open_conflict = NULL WHERE player_id = ?", (_pid(),))
+
+
+def load_open_conflict(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute(
+        "SELECT open_conflict FROM desk_state WHERE player_id = ?",
+        (_pid(),),
+    ).fetchone()
+    if row is None or row["open_conflict"] is None:
+        return None
+    text = str(row["open_conflict"]).strip()
+    return text or None
+
+
+def record_open_blocked(
+    conn: sqlite3.Connection,
+    when: datetime,
+    strike: float,
+    wings: int,
+    reason: str,
+    active,
+) -> str:
+    """Log a skipped open and latch the banner until the next successful open."""
+    hint = ""
+    if (
+        wings != SUGGEST_OPEN_WINGS
+        and open_book_hold(active, strike, SUGGEST_OPEN_WINGS) is None
+    ):
+        hint = f" Try width {SUGGEST_OPEN_WINGS} in Open fly."
+    body = f"{OPEN_BLOCKED_PREFIX} {int(strike)} @ {wings}: {reason}{hint}"
+    note_event(conn, when, body)
+    conn.execute(
+        "INSERT INTO desk_state (player_id, regime, stop_pad, use_config) VALUES (?, 's3', 0, 1) "
+        "ON CONFLICT(player_id) DO NOTHING",
+        (_pid(),),
+    )
+    conn.execute(
+        "UPDATE desk_state SET open_conflict = ? WHERE player_id = ?",
+        (body, _pid()),
+    )
+    return body
 
 
 def hold_conflict(conn: sqlite3.Connection, chain: ChainSnapshot | None, strike: float) -> str | None:

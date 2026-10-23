@@ -116,6 +116,7 @@
     }
     paintOpens(engine);
     paintDeadLongs(frame.dead_longs);
+    paintOpenConflict(frame.open_conflict);
     paintLeftovers(frame.leftover_longs);
     const flatten = document.querySelector('form[action="/desk/flatten"] .desk-order');
     if (flatten) {
@@ -161,6 +162,19 @@
       if (label) label.classList.remove("opacity-50");
       openBox.form.elements.auto_open.value = engine.auto_open ? "1" : "0";
     }
+  }
+
+  function paintOpenConflict(text) {
+    const slot = document.getElementById("open-conflict");
+    if (!slot) return;
+    const message = (text || "").trim();
+    if (!message) {
+      slot.hidden = true;
+      slot.textContent = "";
+      return;
+    }
+    slot.hidden = false;
+    slot.textContent = message;
   }
 
   function paintDeadLongs(rows) {

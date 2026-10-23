@@ -587,6 +587,7 @@
     if (ladder && frame.ladder) ladder.innerHTML = frame.ladder.map(ladderRow).join("") || emptyRow(5, "Waiting for a quote.");
     if (blotter && frame.flies) blotter.innerHTML = frame.flies.map(blotterRow).join("") || emptyRow(10, "No flies yet.");
     paintDeadLongs(frame.dead_longs);
+    paintOpenConflict(frame.open_conflict);
     paintPnl(frame.pnl);
     paintMax(frame.max_profit, frame.max_profit_at, frame.max_profit_at_hi, frame.max_profit_n);
     if (watch && typeof frame.manual === "boolean") watch.dataset.manual = frame.manual ? "1" : "0";
@@ -636,6 +637,19 @@
       "<td class=\"px-3 py-0 tabular-nums\">" + strike + "</td>" +
       "<td class=\"px-3 py-0 tabular-nums " + tone + "\">" + signed(row.var) + "</td>" +
       "<td class=\"px-3 py-0 text-right\">" + action + "</td></tr>";
+  }
+
+  function paintOpenConflict(text) {
+    const slot = document.getElementById("open-conflict");
+    if (!slot) return;
+    const message = (text || "").trim();
+    if (!message) {
+      slot.hidden = true;
+      slot.textContent = "";
+      return;
+    }
+    slot.hidden = false;
+    slot.textContent = message;
   }
 
   function paintDeadLongs(rows) {

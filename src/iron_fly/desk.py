@@ -30,6 +30,10 @@ from iron_fly.orders import (
     live_wing_bids,
     park_lots,
     priced_short_conflicts,
+    clear_open_conflict,
+    load_open_conflict,
+    open_book_hold,
+    record_open_blocked,
     release_longs,
     reusable_wing_lots,
     sell_ready_leftovers,
@@ -470,6 +474,7 @@ def sheet(
     data["open_paused"] = engine["open_paused"]
     data["leftover_longs"] = leftover_long_panel(conn, marks.chain)
     data["dead_longs"] = dead_long_banner(data.get("flies") or [])
+    data["open_conflict"] = load_open_conflict(conn)
     data["engine_line"] = engine["line"]
     data["has_fly"] = bool(book.flies)
     data["block_open"] = not tradable
@@ -499,6 +504,19 @@ def sheet(
     return data
 
 
+def _skip_open(
+    conn: sqlite3.Connection,
+    book: FlyBook,
+    clock: datetime,
+    strike: float,
+    wings: int,
+    reason: str,
+) -> str:
+    record_open_blocked(conn, clock, strike, wings, reason, book.active())
+    log.info("step %s fill open %s skipped %s", _clock_text(clock), int(strike), reason)
+    return "conflict"
+
+
 def open_strike(
     conn: sqlite3.Connection,
     settings: Settings,
@@ -523,10 +541,12 @@ def open_strike(
     chain = marks.chain
     if settings.desk_mode in BACKTEST_MODES and day is not None:
         chain = chain_asof(settings, day, clock)
+    book_hold = open_book_hold(book.active(), strike, width)
+    if book_hold:
+        return _skip_open(conn, book, clock, strike, width, book_hold)
     conflict, wing_sales = priced_short_conflicts(conn, chain, strike)
     if conflict:
-        log.info("step %s fill open %s skipped %s", _clock_text(clock), int(strike), conflict)
-        return "conflict"
+        return _skip_open(conn, book, clock, strike, width, conflict)
     reused = reusable_wing_lots(conn, chain, strike, width)
     if reused is not None:
         rejected, fill = _send_open_shorts(settings, conn, chain, strike)
@@ -543,6 +563,7 @@ def open_strike(
         consume_wing_lots(conn, reused)
         _release_blocking_longs(conn, book, wing_sales, _clock_text(clock), clock)
         book.open_fly(strike, round(float(credit), 2), width, clock)
+        clear_open_conflict(conn)
         note_event(
             conn,
             clock,
@@ -590,6 +611,7 @@ def open_strike(
         credit = abs(float(fill))
     _release_blocking_longs(conn, book, wing_sales, _clock_text(clock), clock)
     book.open_fly(strike, round(float(credit), 2), width, clock)
+    clear_open_conflict(conn)
     note_event(conn, clock, f"Opened fly {int(strike)} ({_fly_legs(strike, width)}) at {float(credit):.2f}")
     save_book(conn, book)
     log.info(
@@ -1046,7 +1068,7 @@ def clear_flies(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM desk_event WHERE player_id = ?", (_pid(),))
     forget_policy(_pid())
     conn.execute(
-        "UPDATE desk_state SET applied_at = NULL, regime_latch = NULL WHERE player_id = ?",
+        "UPDATE desk_state SET applied_at = NULL, regime_latch = NULL, open_conflict = NULL WHERE player_id = ?",
         (_pid(),),
     )
 
@@ -1652,6 +1674,7 @@ def watch_frame(conn: sqlite3.Connection, settings: Settings, marks: DeskMarks) 
         },
         "leftover_longs": model.get("leftover_longs") or [],
         "dead_longs": model.get("dead_longs") or [],
+        "open_conflict": model.get("open_conflict"),
         "pnl": model.get("pnl_mid_total"),
         "last": model.get("last_price"),
         "em_open": model.get("em_open"),
@@ -1949,8 +1972,14 @@ def _fill_intent(
     if chain is None and settings.desk_mode not in BOOK_FILLS:
         chain = chain_asof(settings, day, ts)
     if intent.kind is IntentKind.ADD:
+        book_hold = open_book_hold(strategy.book.active(), strike, width)
+        if book_hold:
+            record_open_blocked(conn, ts, strike, width, book_hold, strategy.book.active())
+            log.info("step %s fill open %s skipped %s", clock, int(strike), book_hold)
+            return False
         conflict, wing_sales = priced_short_conflicts(conn, chain, strike)
         if conflict:
+            record_open_blocked(conn, ts, strike, width, conflict, strategy.book.active())
             log.info("step %s fill open %s skipped %s", clock, int(strike), conflict)
             return False
         reused = reusable_wing_lots(conn, chain, strike, width)
@@ -1977,6 +2006,7 @@ def _fill_intent(
             intent.payload["credit"] = mark
             intent.payload["wings"] = width
             strategy.apply_intent(intent, ts)
+            clear_open_conflict(conn)
             kind = "Opened straddle" if reused is not None else "Opened fly"
             note_event(conn, ts, f"{kind} {int(strike)} ({_fly_legs(strike, width)}) at {float(mark):.2f}")
             log.info(
@@ -2007,6 +2037,7 @@ def _fill_intent(
             intent.payload["credit"] = mark
             intent.payload["wings"] = width
             strategy.apply_intent(intent, ts)
+            clear_open_conflict(conn)
             note_event(conn, ts, f"Opened straddle {int(strike)} ({_fly_legs(strike, width)}) at {float(mark):.2f}")
             log.info(
                 "step %s fill open %s credit=%.2f wings=%s reused longs",
@@ -2043,6 +2074,7 @@ def _fill_intent(
         intent.payload["credit"] = mark
         intent.payload["wings"] = width
         strategy.apply_intent(intent, ts)
+        clear_open_conflict(conn)
         note_event(conn, ts, f"Opened fly {int(strike)} ({_fly_legs(strike, width)}) at {float(mark):.2f}")
         log.info(
             "step %s fill open %s credit=%.2f wings=%s %s",
