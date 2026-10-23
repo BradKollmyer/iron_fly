@@ -135,9 +135,37 @@ def migrate(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    long_columns = {row[1] for row in conn.execute("PRAGMA table_info(leftover_long)")}
+    if "from_strike" not in long_columns:
+        conn.execute("ALTER TABLE leftover_long ADD COLUMN from_strike REAL")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS desk_event (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id TEXT NOT NULL,
+            happened_at TEXT NOT NULL,
+            body TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS leftover_roll (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id TEXT NOT NULL,
+            rolled_at TEXT NOT NULL,
+            right TEXT NOT NULL,
+            from_strike REAL NOT NULL,
+            to_strike REAL NOT NULL,
+            mark REAL
+        )
+        """
+    )
     fly_columns = {row[1] for row in conn.execute("PRAGMA table_info(fly)")}
     if "pnl" not in fly_columns:
         conn.execute("ALTER TABLE fly ADD COLUMN pnl REAL")
+    if "sales_json" not in fly_columns:
+        conn.execute("ALTER TABLE fly ADD COLUMN sales_json TEXT NOT NULL DEFAULT '[]'")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS fly_history (

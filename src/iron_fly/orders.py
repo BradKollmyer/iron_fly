@@ -1,16 +1,18 @@
 """Leftover longs and the hold check that refuses a short already held long.
 
-A 4-leg close that finds a dead wing buys back the two shorts and parks the
-wings. Those parked longs show above the blotter. A later open is refused
-only when one of its new shorts is the same contract. Matching wing leftovers
-can be reused: STO the short straddle and attach the parked longs.
+A close that finds a dead wing buys back the two shorts on that same print,
+sells each wing that still has a bid, and parks only the wing with no bid.
+A later open sells a parked long that is its new short when that long has a
+bid, then opens. A parked long with no bid still blocks that short. Matching
+wing leftovers can be reused: STO the short straddle and attach the parked longs.
 """
 
 from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import time
+import threading
+from datetime import datetime, time
 
 from iron_fly.config import Settings
 from iron_fly.domain.market import ChainSnapshot, StrikeQuote, mid
@@ -22,6 +24,59 @@ DEAD_LONG_MARK = 0.05
 HOLD_CONFLICT = "Same contract cannot stay long and short."
 ROLL_ABOVE = 0.50
 ROLL_TARGET = 0.40
+
+
+def note_event(conn: sqlite3.Connection, when: datetime, text: str) -> None:
+    """Append one trading event. The blotter stays a fly list; this is the log."""
+    conn.execute(
+        "INSERT INTO desk_event (player_id, happened_at, body) VALUES (?, ?, ?)",
+        (_pid(), when.isoformat(), text),
+    )
+
+
+_POLICY: dict[str, tuple[str, str, str]] = {}
+_POLICY_LOCK = threading.Lock()
+
+
+def forget_policy(player: str | None = None) -> None:
+    """Drop the last regime, stop, and wings so the next print is a fresh baseline."""
+    with _POLICY_LOCK:
+        if player is None:
+            _POLICY.clear()
+        else:
+            _POLICY.pop(player, None)
+
+
+def note_policy(conn: sqlite3.Connection, when: datetime, regime: str, stop: int, wings: str) -> None:
+    """Record a regime, stop, or wing change. The first print only sets the baseline."""
+    from iron_fly.strategy.rules import REGIME_LABELS
+
+    current = (str(regime), str(int(stop)), str(wings))
+    with _POLICY_LOCK:
+        player = _pid()
+        previous = _POLICY.get(player)
+        _POLICY[player] = current
+        if previous is None or previous == current:
+            return
+        if previous[0] != current[0]:
+            note_event(conn, when, f"Regime {REGIME_LABELS.get(current[0], current[0])}")
+        if previous[1] != current[1]:
+            note_event(conn, when, f"Stop +{current[1]}")
+        if previous[2] != current[2]:
+            note_event(conn, when, f"Wings {current[2]}")
+
+
+def event_rows(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT happened_at, body FROM desk_event WHERE player_id = ? ORDER BY id",
+        (_pid(),),
+    ).fetchall()
+    return [{"at": str(row["happened_at"]), "text": str(row["body"])} for row in rows]
+
+
+def _fly_legs(strike: float, wings: int) -> str:
+    center = int(round(strike))
+    return f"{int(round(strike - wings))}/{center}/{int(round(strike + wings))}"
 
 
 def dead_reason(bid: float | None, ask: float | None) -> str | None:
@@ -99,6 +154,29 @@ def park_wings(conn: sqlite3.Connection, chain: ChainSnapshot | None, strike: fl
     return park_lots(conn, wing_lots(chain, strike, wings))
 
 
+def live_wing_bids(
+    chain: ChainSnapshot | None,
+    strike: float,
+    wings: int,
+) -> tuple[list[dict], list[dict]]:
+    """Wings to sell at the bid, and wings to park.
+
+    A bid above zero sells on the stop print with the shorts. A wing with no
+    bid stays parked.
+    """
+    sell: list[dict] = []
+    park: list[dict] = []
+    for lot in wing_lots(chain, strike, wings):
+        bid = _positive_bid(chain, str(lot["right"]), float(lot["strike"]))
+        if bid is None:
+            park.append(lot)
+            continue
+        sold = dict(lot)
+        sold["bid"] = bid
+        sell.append(sold)
+    return sell, park
+
+
 def leftovers_sell_allowed(wall: time, auto: dict[str, object] | None = None) -> bool:
     """True while parked longs may still be sold or rolled."""
     return wall < leftover_until_clock(auto)
@@ -167,7 +245,7 @@ def leftover_long_rows(conn: sqlite3.Connection) -> list[dict]:
     """Parked longs. Empty when every long is still attached to a fly."""
     rows = conn.execute(
         """
-        SELECT occ, right, strike, quantity FROM leftover_long
+        SELECT occ, right, strike, quantity, from_strike FROM leftover_long
         WHERE player_id = ?
         ORDER BY strike, right
         """,
@@ -179,6 +257,7 @@ def leftover_long_rows(conn: sqlite3.Connection) -> list[dict]:
             "right": str(row["right"]),
             "strike": float(row["strike"]),
             "quantity": int(row["quantity"]),
+            "from_strike": None if row["from_strike"] is None else float(row["from_strike"]),
         }
         for row in rows
     ]
@@ -208,6 +287,7 @@ def leftover_long_panel(conn: sqlite3.Connection, chain: ChainSnapshot | None) -
                 "bid": bid,
                 "ask": ask,
                 "mid": None if mark is None else round(mark, 2),
+                "from_strike": lot.get("from_strike"),
                 "dead": reason is not None,
                 "dead_reason": reason,
             }
@@ -215,38 +295,98 @@ def leftover_long_panel(conn: sqlite3.Connection, chain: ChainSnapshot | None) -
     return out
 
 
+def _positive_bid(chain: ChainSnapshot | None, right: str, strike: float) -> float | None:
+    row = _row(chain, strike)
+    if row is None:
+        return None
+    bid, _ask = _side(row, right)
+    if bid is None or bid <= 0:
+        return None
+    return float(bid)
+
+
+def _conflicting_lots(conn: sqlite3.Connection, chain: ChainSnapshot | None, strike: float) -> list[dict]:
+    """Parked longs whose contract is the call or put at this short."""
+    parked = leftover_long_rows(conn)
+    if not parked:
+        return []
+    by_key = {_key(str(lot["right"]), float(lot["strike"])): lot for lot in parked}
+    by_occ = {str(lot["occ"]): lot for lot in parked}
+    hits: list[dict] = []
+    seen: set[str] = set()
+    for right in ("call", "put"):
+        row = _row(chain, strike)
+        occ = _occ(row, right, strike)
+        lot = by_occ.get(occ) or by_key.get(_key(right, float(strike)))
+        if lot is None:
+            continue
+        ident = str(lot["occ"])
+        if ident in seen:
+            continue
+        seen.add(ident)
+        hits.append(lot)
+    return hits
+
+
 def hold_conflict(conn: sqlite3.Connection, chain: ChainSnapshot | None, strike: float) -> str | None:
     """Refuse an open whose new short is already a leftover long.
 
     A wing parked at another strike does not block the open.
     """
-    parked = leftover_long_rows(conn)
-    if not parked:
+    lots = _conflicting_lots(conn, chain, strike)
+    if not lots:
         return None
-    keys = set()
-    for lot in parked:
-        keys.add(lot["occ"])
-        keys.add(_key(str(lot["right"]), float(lot["strike"])))
-    hits = []
-    for right in ("call", "put"):
-        row = _row(chain, strike)
-        occ = _occ(row, right, strike)
-        if occ in keys or _key(right, strike) in keys:
-            hits.append(f"long {int(strike)} {right}")
-    if not hits:
-        return None
+    hits = [f"long {int(strike)} {lot['right']}" for lot in lots]
     return "This fly would fight leftover longs (" + ", ".join(hits) + "). " + HOLD_CONFLICT
+
+
+def priced_short_conflicts(
+    conn: sqlite3.Connection,
+    chain: ChainSnapshot | None,
+    strike: float,
+) -> tuple[str | None, list[dict]]:
+    """Parked longs that are this short, each priced at its bid.
+
+    When any of those longs has no bid, the conflict message is set and the
+    sale list is empty. The caller leaves every row parked.
+    """
+    lots = _conflicting_lots(conn, chain, strike)
+    if not lots:
+        return None, []
+    priced: list[dict] = []
+    for lot in lots:
+        bid = _positive_bid(chain, str(lot["right"]), float(lot["strike"]))
+        if bid is None:
+            return hold_conflict(conn, chain, strike), []
+        sold = dict(lot)
+        sold["bid"] = bid
+        priced.append(sold)
+    return None, priced
+
+
+def release_longs(conn: sqlite3.Connection, lots: list[dict]) -> None:
+    """Drop parked rows that were sold on this print."""
+    pid = _pid()
+    for lot in lots:
+        conn.execute(
+            "DELETE FROM leftover_long WHERE player_id = ? AND occ = ?",
+            (pid, str(lot["occ"])),
+        )
 
 
 def sell_ready_leftovers(
     conn: sqlite3.Connection,
     settings: Settings,
     chain: ChainSnapshot | None,
+    auto: dict[str, object] | None = None,
+    when: datetime | None = None,
 ) -> int:
-    """Sell a cheap parked long. Roll one worth more than $0.50 to the $0.40 strike.
+    """Sell a cheap parked long. Roll one above roll_above to the roll_to strike.
 
-    The put and the call are separate. The $0.40 wing stays parked.
+    The put and the call are separate. The wing already at roll_to stays parked.
     """
+    above = _threshold(auto, "roll_above", ROLL_ABOVE)
+    target_price = _threshold(auto, "roll_to", ROLL_TARGET)
     done = 0
     for lot in leftover_long_rows(conn):
         right = str(lot["right"])
@@ -254,17 +394,17 @@ def sell_ready_leftovers(
         row = _row(chain, strike)
         bid, ask = (None, None) if row is None else _side(row, right)
         value = _value(bid, ask)
-        anchor = _forty_strike(chain, right)
+        anchor = _forty_strike(chain, right, target=target_price)
         if anchor is not None and int(anchor) == int(strike):
             continue
-        if value is not None and value > ROLL_ABOVE:
-            target = _forty_strike(chain, right, beyond=strike)
-            if target is not None and _roll_leftover(conn, settings, chain, lot, target):
+        if value is not None and value > above:
+            target = _forty_strike(chain, right, beyond=strike, target=target_price)
+            if target is not None and _roll_leftover(conn, settings, chain, lot, target, when, value):
                 done += 1
                 continue
         if bid is None or bid <= 0:
             continue
-        if close_leftover_long(conn, settings, chain, str(lot["occ"])) is None:
+        if close_leftover_long(conn, settings, chain, str(lot["occ"]), when) is None:
             done += 1
     return done
 
@@ -278,8 +418,21 @@ def _value(bid: float | None, ask: float | None) -> float | None:
     return None
 
 
-def _forty_strike(chain: ChainSnapshot | None, right: str, *, beyond: float | None = None) -> float | None:
-    """Strike of this right whose mid is nearest $0.40. `beyond` stays further out."""
+def _threshold(auto: dict[str, object] | None, key: str, default: float) -> float:
+    raw = (auto or {}).get(key)
+    if raw in (None, ""):
+        return default
+    return float(raw)
+
+
+def _forty_strike(
+    chain: ChainSnapshot | None,
+    right: str,
+    *,
+    beyond: float | None = None,
+    target: float = ROLL_TARGET,
+) -> float | None:
+    """Strike of this right whose mid is nearest `target`. `beyond` stays further out."""
     if chain is None:
         return None
     marks: list[tuple[float, float]] = []
@@ -294,7 +447,7 @@ def _forty_strike(chain: ChainSnapshot | None, right: str, *, beyond: float | No
         marks.append((row.strike, mark))
     if not marks:
         return None
-    return min(marks, key=lambda item: (abs(item[1] - ROLL_TARGET), abs(item[0] - (beyond or item[0]))))[0]
+    return min(marks, key=lambda item: (abs(item[1] - target), abs(item[0] - (beyond or item[0]))))[0]
 
 
 def _roll_leftover(
@@ -303,6 +456,8 @@ def _roll_leftover(
     chain: ChainSnapshot | None,
     lot: dict,
     target: float,
+    when: datetime | None = None,
+    mark: float | None = None,
 ) -> bool:
     """STC this long and BTO the further strike. The new long stays parked."""
     right = str(lot["right"])
@@ -312,8 +467,19 @@ def _roll_leftover(
     if opened == closed:
         return False
     quantity = int(lot["quantity"])
-    _replace_leftover(conn, closed, opened, right, target, quantity)
-    log.info("step rolled leftover %s %s to %s", right, int(lot["strike"]), int(target))
+    origin = float(lot["strike"])
+    _replace_leftover(conn, closed, opened, right, target, quantity, origin)
+    stored = None if mark is None else round(float(mark), 2)
+    conn.execute(
+        """
+        INSERT INTO leftover_roll (player_id, rolled_at, right, from_strike, to_strike, mark)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (_pid(), (when or datetime.now()).isoformat(), right, origin, float(target), stored),
+    )
+    price = "" if stored is None else f" {stored:.2f}"
+    note_event(conn, when or datetime.now(), f"Rolled long {right} {int(origin)}{price} → {int(target)}")
+    log.info("step rolled leftover %s %s to %s", right, int(origin), int(target))
     return True
 
 
@@ -324,6 +490,7 @@ def _replace_leftover(
     right: str,
     strike: float,
     quantity: int,
+    from_strike: float | None = None,
 ) -> None:
     pid = _pid()
     conn.execute(
@@ -332,12 +499,13 @@ def _replace_leftover(
     )
     conn.execute(
         """
-        INSERT INTO leftover_long (player_id, occ, right, strike, quantity)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO leftover_long (player_id, occ, right, strike, quantity, from_strike)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(player_id, occ) DO UPDATE SET
-            quantity = leftover_long.quantity + excluded.quantity
+            quantity = leftover_long.quantity + excluded.quantity,
+            from_strike = excluded.from_strike
         """,
-        (pid, opened, right, strike, quantity),
+        (pid, opened, right, strike, quantity, from_strike),
     )
 
 
@@ -346,6 +514,7 @@ def close_leftover_long(
     settings: Settings,
     chain: ChainSnapshot | None,
     occ: str,
+    when: datetime | None = None,
 ) -> str | None:
     """STC one parked long at the bid from the replay chain."""
     lot = next((row for row in leftover_long_rows(conn) if row["occ"] == occ), None)
@@ -358,6 +527,11 @@ def close_leftover_long(
     conn.execute(
         "DELETE FROM leftover_long WHERE player_id = ? AND occ = ?",
         (_pid(), occ),
+    )
+    note_event(
+        conn,
+        when or datetime.now(),
+        f"Closed long {lot['right']} {int(lot['strike'])} at {float(bid):.2f}",
     )
     log.info("step sold leftover long %s %s", lot["right"], int(lot["strike"]))
     return None

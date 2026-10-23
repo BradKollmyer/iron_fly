@@ -10,7 +10,9 @@ cookies_min_flies: 1        # cookies only while at least this many flies are op
 follow_wings: false          # from 9:35, width tracks the 0.40 put and never widens
 wing_steps: [50, 20]    # widths follow_wings may snap to
 add_until: "16:00"          # no new fly from here; drops still run until 16:01
-leftover_until: "10:00"     # stop sell/roll of parked wings; reopen can reuse them
+leftover_until: "15:40"     # stop sell/roll of parked wings; reopen can reuse them
+roll_above: 1.00    # roll a parked long when its value is above this
+roll_to: 0.40       # roll it to the strike nearest this price
 fill_mode_open: bid         # mid or bid (worst STO credit)
 fill_mode_close: ask        # mid or ask (worst BTC debit)
 picks:                      # a clock stays on; EM and EM% follow the reading

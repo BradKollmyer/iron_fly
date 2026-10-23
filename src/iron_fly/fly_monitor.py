@@ -237,7 +237,7 @@ def _refresh(conn, settings: Settings, now: datetime | None) -> FlyBoard:
                     from iron_fly.desk import _leftover_auto
 
                     if leftovers_sell_allowed(wall, _leftover_auto(conn)):
-                        sell_ready_leftovers(conn, settings, chain)
+                        sell_ready_leftovers(conn, settings, chain, _leftover_auto(conn), clock)
         elif not active or past_cash:
             _write_pnl(conn, book, None, clock)
         keep = previous if chain is None and active else None

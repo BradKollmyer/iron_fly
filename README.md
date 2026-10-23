@@ -4,7 +4,7 @@ Docker-first **Dale's** SPX 0DTE iron-fly **backtest** desk and CLI.
 Inspired by [Dale's iron fly on YouTube](https://www.youtube.com/watch?v=kNR2r8Nj3qI).
 
 Strategy rules come from
-[`iron_fly_strategy@v0.1.6`](https://github.com/askosyrskiy/iron_fly_strategy).
+[`iron_fly_strategy@v0.1.8`](https://github.com/askosyrskiy/iron_fly_strategy).
 Session tapes are gzipped on Cloudflare R2 (~1.5 MB/day). Each day file stores
 **SPX prints every 1 second** and the **option chain every 2 seconds**.
 
@@ -26,7 +26,7 @@ Default configuration is `config/default.yaml` (paste/Apply in **Configuration**
 ```bash
 cp .env.example .env
 python3.12 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"   # pulls iron-fly-strategy@v0.1.6 from GitHub
+pip install -e ".[dev]"   # pulls iron-fly-strategy@v0.1.8 from GitHub
 
 make run-local            # hydrate last 10 days from R2, then serve
 # open http://localhost:8000
@@ -211,6 +211,8 @@ wing_steps: [50, 30, 20]    # widths follow_wings may snap to
 add_until: "15:58"          # no new fly from here; drops still run until 16:01
 #flatten_at: "15:49"        # flatten the wings at 15:00
 leftover_until: "15:45"     # stop sell/roll of parked wings; reopen can reuse them
+roll_above: 0.50            # roll a parked long when its value is above this
+roll_to: 0.40               # roll it to the strike nearest this price
 fill_mode_open: mid         # mid or bid (worst STO credit)
 fill_mode_close: mid        # mid or ask (worst BTC debit)
 picks:                      # a clock stays on; EM and EM% follow the reading
@@ -264,6 +266,8 @@ These may sit at the top level (preferred) or under a legacy nested `auto:` bloc
 | `add_until` | `HH:MM` | No new flies at/after this clock; drops can still run. |
 | `flatten_at` | `HH:MM` | Start flattening / parking wings for the close. |
 | `leftover_until` | `HH:MM` | Stop sell/roll of parked wings; reopen can still reuse leftovers. Default `15:45`. |
+| `roll_above` | price, `0` or more | Roll a parked long when its value is above this. Default `0.50`. |
+| `roll_to` | price, `0` or more | Roll that long to the strike nearest this price. Default `0.40`. |
 
 ### Fill / replay pricing (optional)
 

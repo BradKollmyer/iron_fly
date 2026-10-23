@@ -118,6 +118,9 @@ def _walk(text: str, days: list[date], *, replay: Path | None = None):
                     last=float(last["value"]),
                 )
                 frame = watch_frame(conn, settings, marks)
+                from iron_fly.orders import event_rows
+
+                events = event_rows(conn)
                 settled = marks.ts is not None and marks.ts.astimezone(_ET).time() >= time(16, 0)
                 opened = [
                     datetime.fromisoformat(row["opened_at"])
@@ -133,7 +136,15 @@ def _walk(text: str, days: list[date], *, replay: Path | None = None):
         first_em, first_pct = _reading_at(marks.tape, opened[0]) if opened else (None, None)
         yield DayResult(
             day,
-            _report(day, spec.summary(), frame, settled=settled, tape=marks.tape or [], opened=opened),
+            _report(
+                day,
+                spec.summary(),
+                frame,
+                settled=settled,
+                tape=marks.tape or [],
+                opened=opened,
+                events=events,
+            ),
             float(pnl) if isinstance(pnl, (int, float)) else None,
             em_open,
             first_em,
@@ -249,6 +260,7 @@ def _report(
     settled: bool,
     tape: list | None = None,
     opened: list[datetime] | None = None,
+    events: list | None = None,
 ) -> str:
     lines = [f"{day.isoformat()}  {summary} · open EM {_quote(frame.get('em_open'))}"]
     flies = frame.get("flies") or []
@@ -257,16 +269,24 @@ def _report(
     stamps = [int(point["time"]) for point in tape or []]
     opens = opened or []
     for index, fly in enumerate(flies):
-        close = fly.get("time_close") or ("16:00" if settled and fly.get("status") == "active" else "open")
+        close = fly.get("time_close") or ("16:00:00" if settled and fly.get("status") == "active" else "open")
         strike = int(fly["strike"]) if fly.get("strike") is not None else "—"
         sto = "—" if fly.get("sto") is None else f"{float(fly['sto']):.2f}"
         when = opens[index] if index < len(opens) else None
         em, pct = _reading_at(tape or [], when, stamps)
         lines.append(
-            f"  {fly.get('time_open') or '—':<5} {close:<5}  {strike}  wings {fly.get('wings')}  "
+            f"  {fly.get('time_open') or '—':<8} {close:<8}  {strike}  wings {fly.get('wings')}  "
             f"sto {sto}  em {_quote(em):>6}  em% {_quote(pct):>5}  pnl {_dollars(fly.get('pnl'))}"
         )
     lines.append(f"P&L {_dollars(frame.get('pnl'))}")
+    lines.append("")
+    lines.append("Events")
+    lines.append("----------")
+    if not events:
+        lines.append("  none")
+    else:
+        for event in events:
+            lines.append(f"  {_event_clock(event.get('at'))} {event.get('text')}")
     return "\n".join(lines)
 
 
@@ -284,6 +304,15 @@ def _reading_at(
         return None, None
     point = tape[index]
     return _num(point.get("em")), _num(point.get("pct"))
+
+
+def _event_clock(raw: object) -> str:
+    if not isinstance(raw, str) or not raw:
+        return "—"
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(_ET)
+    return parsed.strftime("%H:%M:%S")
 
 
 def _quote(value: object) -> str:

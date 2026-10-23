@@ -13,6 +13,7 @@ from iron_fly.db import connect, migrate
 from iron_fly.desk import _fill_intent, load_book, open_strike
 from iron_fly.domain.market import ChainSnapshot, DeskMarks, StrikeQuote, combo_mark
 from iron_fly.domain.models import Intent, IntentKind
+from iron_fly.orders import leftover_long_rows, park_lots, sell_ready_leftovers, short_mark
 from iron_fly.strategy.dale_og import DaleOg
 
 ET = ZoneInfo("America/New_York")
@@ -88,4 +89,146 @@ def test_backtest_refuses_open_without_combo_mid_then_retries(tmp_path, caplog):
     opened = [fly for fly in strategy.book.flies if fly.strike == 7700 and fly.status == "active"]
     assert len(opened) == 1
     assert float(opened[0].credit) == combo_mark(full, 7700, 50)
+    conn.close()
+
+
+def _wing_chain() -> ChainSnapshot:
+    """7640 fly, dead 7620 put, live 7660 call, and the 7660 fly's far wing."""
+    return ChainSnapshot(
+        ts=None,
+        expiration=None,
+        strikes=(
+            _strike(7620, (0.10, 0.20), (0.00, 0.05)),
+            _strike(7640, (11.10, 11.50), (0.60, 0.70)),
+            _strike(7660, (1.05, 1.10), (3.20, 3.40)),
+            _strike(7680, (0.10, 0.15), (12.0, 12.4)),
+        ),
+    )
+
+
+def test_stop_sells_the_wing_with_a_bid_and_parks_the_dead_one(tmp_path):
+    """A dead put parks only that put. The call bid comes off the stop debit."""
+    chain = _wing_chain()
+    when = datetime(2026, 10, 22, 15, 50, 13, tzinfo=ET)
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    migrate(conn)
+    strategy = DaleOg()
+    strategy.book.open_fly(7640, 8.30, 20, when.replace(minute=46))
+    intent = Intent(IntentKind.CLOSE, "expiration breakeven", {"strike": 7640.0})
+    assert _fill_intent(conn, settings, date(2026, 10, 22), strategy, intent, when, 20, chain) is True
+    expected = round(float(short_mark(chain, 7640) or 0) - 1.05, 2)
+    assert float(intent.payload["debit"]) == expected
+    parked = [(row["right"], int(row["strike"])) for row in leftover_long_rows(conn)]
+    assert parked == [("put", 7620)]
+    assert strategy.book.flies[0].sales == [{"right": "call", "strike": 7660.0, "bid": 1.05}]
+
+    opened = Intent(IntentKind.ADD, "watch tagged", {"strike": 7660.0, "wings": 20})
+    assert (
+        _fill_intent(
+            conn,
+            settings,
+            date(2026, 10, 22),
+            strategy,
+            opened,
+            when.replace(second=45),
+            20,
+            chain,
+        )
+        is True
+    )
+    assert any(fly.strike == 7660 and fly.status == "active" for fly in strategy.book.flies)
+    conn.close()
+
+
+def test_add_sells_a_parked_long_that_blocks_the_short(tmp_path):
+    """A parked call with a bid is sold on the add print, then the fly opens."""
+    chain = _wing_chain()
+    when = datetime(2026, 10, 22, 15, 50, 45, tzinfo=ET)
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    migrate(conn)
+    park_lots(
+        conn,
+        [{"occ": "call:7660", "right": "call", "strike": 7660.0, "quantity": 1}],
+    )
+    strategy = DaleOg()
+    strategy.book.open_fly(7640, 8.30, 20, when.replace(minute=46))
+    strategy.book.close_fly(7640, 11.95, when.replace(second=13))
+    intent = Intent(IntentKind.ADD, "watch tagged", {"strike": 7660.0, "wings": 20})
+    assert _fill_intent(conn, settings, date(2026, 10, 22), strategy, intent, when, 20, chain) is True
+    closed = next(fly for fly in strategy.book.flies if fly.strike == 7640)
+    assert closed.close_debit == round(11.95 - 1.05, 2)
+    assert leftover_long_rows(conn) == []
+    assert any(fly.strike == 7660 and fly.status == "active" for fly in strategy.book.flies)
+    conn.close()
+
+
+def test_add_stays_blocked_when_the_parked_long_has_no_bid(tmp_path):
+    chain = ChainSnapshot(
+        ts=None,
+        expiration=None,
+        strikes=(
+            _strike(7640, (11.10, 11.50), (0.60, 0.70)),
+            _strike(7660, (0.00, 0.05), (3.20, 3.40)),
+            _strike(7680, (0.10, 0.15), (12.0, 12.4)),
+        ),
+    )
+    when = datetime(2026, 10, 22, 15, 50, 45, tzinfo=ET)
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    migrate(conn)
+    park_lots(
+        conn,
+        [{"occ": "call:7660", "right": "call", "strike": 7660.0, "quantity": 1}],
+    )
+    strategy = DaleOg()
+    intent = Intent(IntentKind.ADD, "watch tagged", {"strike": 7660.0, "wings": 20})
+    assert _fill_intent(conn, settings, date(2026, 10, 22), strategy, intent, when, 20, chain) is False
+    assert [(row["right"], int(row["strike"])) for row in leftover_long_rows(conn)] == [("call", 7660)]
+    assert strategy.book.active() == []
+    conn.close()
+
+
+def test_a_rich_parked_long_rolls_and_remembers_where_it_came_from(tmp_path):
+    chain = ChainSnapshot(
+        ts=None,
+        expiration=None,
+        strikes=(
+            _strike(7660, (1.10, 1.30), (0.05, 0.10)),
+            _strike(7685, (0.35, 0.45), (0.05, 0.10)),
+        ),
+    )
+    when = datetime(2026, 10, 22, 15, 48, tzinfo=ET)
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    migrate(conn)
+    park_lots(conn, [{"occ": "call:7660", "right": "call", "strike": 7660.0, "quantity": 1}])
+    assert sell_ready_leftovers(conn, settings, chain, None, when) == 1
+    parked = leftover_long_rows(conn)
+    assert [(row["right"], int(row["strike"]), int(row["from_strike"])) for row in parked] == [("call", 7685, 7660)]
+    roll = conn.execute("SELECT right, from_strike, to_strike, mark FROM leftover_roll").fetchone()
+    assert (roll["right"], int(roll["from_strike"]), int(roll["to_strike"]), float(roll["mark"])) == (
+        "call",
+        7660,
+        7685,
+        1.2,
+    )
+    conn.close()
+
+
+def test_regime_stop_and_wing_changes_are_events(tmp_path):
+    from iron_fly.orders import event_rows, forget_policy, note_policy
+
+    when = datetime(2026, 10, 22, 15, 45, 2, tzinfo=ET)
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    migrate(conn)
+    forget_policy()
+    note_policy(conn, when, "ladder", 3, "20")
+    note_policy(conn, when.replace(second=3), "ladder", 3, "20")
+    later = when.replace(minute=50, second=13)
+    note_policy(conn, later, "cookies", 5, "15")
+    texts = [row["text"] for row in event_rows(conn)]
+    assert texts == ["Regime Cookies ±2.5 / 5", "Stop +5", "Wings 15"]
     conn.close()

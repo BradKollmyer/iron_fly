@@ -4,7 +4,11 @@ PYTHON := python3
 endif
 
 # Editable installs can flake; always put src/ on the path for local runs.
-export PYTHONPATH := src$(if $(PYTHONPATH),:$(PYTHONPATH),)
+# Python skips UF_HIDDEN .pth files, and macOS re-hides everything under .venv,
+# so the iron-fly-strategy editable install never reaches sys.path. Use the
+# sibling checkout when it is present.
+STRATEGY_SRC := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../iron_fly_strategy/src)
+export PYTHONPATH := src$(if $(wildcard $(STRATEGY_SRC)/iron_fly_strategy/__init__.py),:$(STRATEGY_SRC),)$(if $(PYTHONPATH),:$(PYTHONPATH),)
 
 REPLAY_BOOTSTRAP_DAYS ?= 10
 ARGS ?=

@@ -228,6 +228,14 @@ def _release_prior_day_wings(conn, previous: CurrentConfig, clock: datetime) -> 
     conn.execute("UPDATE desk_state SET eff_wings = NULL WHERE player_id = ?", (_pid(),))
 
 
+def _note_policy(conn, clock: datetime, regime: str, stop: int, wings: str) -> None:
+    from iron_fly.orders import note_policy
+    from iron_fly.strategy.rules import wings_for_clock
+
+    shown = wings if str(wings) != "auto" else str(wings_for_clock(book_clock(clock)))
+    note_policy(conn, clock, regime, int(stop), shown)
+
+
 def _desk(
     conn,
     clock: datetime,
@@ -253,6 +261,7 @@ def _desk(
     spec = _saved_spec(conn) if engine["use_config"] else None
     if spec is None:
         regime, wings, stop = _clean(regime, wings, stop)
+        _note_policy(conn, clock, regime, stop, wings)
         return regime, wings, stop, bool(engine["use_config"]), False
     state = apply_config_state(
         spec,
@@ -270,6 +279,7 @@ def _desk(
     )
     _save_regime_latch(conn, state.regime_latch)
     regime, wings, stop = _clean(state.regime, state.wings, state.stop)
+    _note_policy(conn, clock, regime, stop, wings)
     return regime, wings, stop, True, True
 
 

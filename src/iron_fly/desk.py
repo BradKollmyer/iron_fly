@@ -19,13 +19,18 @@ from iron_fly.orders import (
     dead_long_banner,
     dead_reason,
     dead_wings,
-    hold_conflict,
+    _fly_legs,
+    forget_policy,
     leftover_long_note,
+    note_event,
+    note_policy,
     leftover_long_panel,
     leftover_long_rows,
     leftovers_sell_allowed,
+    live_wing_bids,
     park_lots,
-    park_wings,
+    priced_short_conflicts,
+    release_longs,
     reusable_wing_lots,
     sell_ready_leftovers,
     short_mark,
@@ -235,6 +240,42 @@ def load_marks(
     return marks
 
 
+def _sale_rows(sales: list) -> list[dict]:
+    rows = []
+    for sale in sales or []:
+        if not isinstance(sale, dict):
+            continue
+        right = sale.get("right")
+        strike = sale.get("strike")
+        bid = sale.get("bid")
+        if right is None or strike is None or bid is None:
+            continue
+        rows.append({"right": str(right), "strike": float(strike), "bid": float(bid)})
+    return rows
+
+
+def _sales_from_row(row) -> list[dict]:
+    keys = row.keys() if hasattr(row, "keys") else []
+    if "sales_json" not in keys:
+        return []
+    try:
+        parsed = json.loads(row["sales_json"] or "[]")
+    except json.JSONDecodeError:
+        return []
+    return _sale_rows(parsed if isinstance(parsed, list) else [])
+
+
+def _remember_sales(fly, lots: list[dict]) -> None:
+    rows = _sale_rows(lots)
+    if not rows:
+        return
+    current = getattr(fly, "sales", None)
+    if current is None:
+        fly.sales = rows
+        return
+    current.extend(rows)
+
+
 def load_book(conn: sqlite3.Connection) -> FlyBook:
     book = FlyBook()
     state = conn.execute("SELECT * FROM desk_state WHERE player_id = ?", (_pid(),)).fetchone()
@@ -255,6 +296,7 @@ def load_book(conn: sqlite3.Connection) -> FlyBook:
         if row["status"] == "closed" and row["close_debit"] is not None:
             closed = datetime.fromisoformat(row["closed_at"]) if row["closed_at"] else opened
             book.close_fly(float(row["strike"]), float(row["close_debit"]), closed)
+        book.flies[-1].sales = _sales_from_row(row)
     return book
 
 
@@ -264,8 +306,10 @@ def save_book(conn: sqlite3.Connection, book: FlyBook) -> None:
     for fly in book.flies:
         conn.execute(
             """
-            INSERT INTO fly (player_id, strike, wings, credit, opened_at, status, close_debit, closed_at, origin)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO fly (
+                player_id, strike, wings, credit, opened_at, status, close_debit, closed_at, origin, sales_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 pid,
@@ -277,6 +321,7 @@ def save_book(conn: sqlite3.Connection, book: FlyBook) -> None:
                 fly.close_debit,
                 fly.closed_at.isoformat() if fly.closed_at else None,
                 fly.origin,
+                json.dumps(_sale_rows(getattr(fly, "sales", []))),
             ),
         )
     conn.execute(
@@ -393,6 +438,7 @@ def sheet(
         )
         _save_regime_latch(conn, state.regime_latch)
         _adopt_state(conn, engine, state, book_clock(clock))
+    note_policy(conn, clock, str(engine["regime"]), int(engine["stop"]), str(engine["wings"]))
     if spot is None:
         data = {
             "last_price": None,
@@ -477,9 +523,9 @@ def open_strike(
     chain = marks.chain
     if settings.desk_mode in BACKTEST_MODES and day is not None:
         chain = chain_asof(settings, day, clock)
-    fought = hold_conflict(conn, chain, strike)
-    if fought:
-        log.info("step %s fill open %s skipped %s", _clock_text(clock), int(strike), fought)
+    conflict, wing_sales = priced_short_conflicts(conn, chain, strike)
+    if conflict:
+        log.info("step %s fill open %s skipped %s", _clock_text(clock), int(strike), conflict)
         return "conflict"
     reused = reusable_wing_lots(conn, chain, strike, width)
     if reused is not None:
@@ -495,7 +541,13 @@ def open_strike(
             )
             return "nomid"
         consume_wing_lots(conn, reused)
+        _release_blocking_longs(conn, book, wing_sales, _clock_text(clock), clock)
         book.open_fly(strike, round(float(credit), 2), width, clock)
+        note_event(
+            conn,
+            clock,
+            f"Opened straddle {int(strike)} ({_fly_legs(strike, width)}) at {float(credit):.2f}",
+        )
         save_book(conn, book)
         log.info(
             "step %s fill open %s credit=%.2f wings=%s reused longs",
@@ -536,7 +588,9 @@ def open_strike(
             fill,
         )
         credit = abs(float(fill))
+    _release_blocking_longs(conn, book, wing_sales, _clock_text(clock), clock)
     book.open_fly(strike, round(float(credit), 2), width, clock)
+    note_event(conn, clock, f"Opened fly {int(strike)} ({_fly_legs(strike, width)}) at {float(credit):.2f}")
     save_book(conn, book)
     log.info(
         "step %s fill open %s credit=%.2f wings=%s",
@@ -691,20 +745,17 @@ def pause_auto_open(conn: sqlite3.Connection) -> None:
 
 
 def _close_open_fly(conn, settings: Settings, book: FlyBook, fly, chain, clock: datetime) -> str | None:
-    """4-leg close, or BTC the shorts when a long wing is dead and park that wing."""
+    """4-leg close, or BTC the shorts and sell each wing that still has a bid."""
     notes = dead_wings(chain, fly.strike, fly.wings)
-    contracts = _SHORT_LEGS if notes else _FLY_LEGS
     if notes:
-        debit = short_mark(chain, fly.strike)
-        if debit is None:
-            return "nomid"
-        rejected = _send_shorts(settings, conn, chain, fly.strike)
+        debit, contracts, rejected, sold = _buy_shorts_sell_live_wings(
+            conn, settings, chain, fly.strike, fly.wings, _clock_text(clock), clock
+        )
         if rejected:
             return rejected
-        lots = park_wings(conn, chain, fly.strike, fly.wings)
-        note = leftover_long_note(lots)
-        if note:
-            log.info("step %s %s", _clock_text(clock), note)
+        if debit is None:
+            return "nomid"
+        _remember_sales(fly, sold)
     else:
         rejected, fill = _send_live(settings, conn, chain, fly.strike, fly.wings, closing=True)
         if rejected:
@@ -725,7 +776,10 @@ def _close_open_fly(conn, settings: Settings, book: FlyBook, fly, chain, clock: 
                 fill,
             )
             debit = abs(float(fill))
+        contracts = _FLY_LEGS
     debit = _add_close_slippage(conn, clock, debit, contracts)
+    if not notes:
+        note_event(conn, clock, f"Closed fly {int(fly.strike)} at {float(debit):.2f}")
     book.close_fly(fly.strike, debit, clock)
     save_book(conn, book)
     return None
@@ -988,6 +1042,9 @@ def clear_flies(conn: sqlite3.Connection) -> None:
     """Drop every fly and parked long so a backtest can start over."""
     conn.execute("DELETE FROM fly WHERE player_id = ?", (_pid(),))
     conn.execute("DELETE FROM leftover_long WHERE player_id = ?", (_pid(),))
+    conn.execute("DELETE FROM leftover_roll WHERE player_id = ?", (_pid(),))
+    conn.execute("DELETE FROM desk_event WHERE player_id = ?", (_pid(),))
+    forget_policy(_pid())
     conn.execute(
         "UPDATE desk_state SET applied_at = NULL, regime_latch = NULL WHERE player_id = ?",
         (_pid(),),
@@ -1087,6 +1144,9 @@ def _archive_flies(conn: sqlite3.Connection, session_day: str) -> int:
     )
     deleted = conn.execute("DELETE FROM fly WHERE player_id = ?", (pid,)).rowcount
     conn.execute("DELETE FROM leftover_long WHERE player_id = ?", (pid,))
+    conn.execute("DELETE FROM leftover_roll WHERE player_id = ?", (pid,))
+    conn.execute("DELETE FROM desk_event WHERE player_id = ?", (pid,))
+    forget_policy(pid)
     return int(deleted)
 
 
@@ -1422,6 +1482,7 @@ def replay_until(conn: sqlite3.Connection, settings: Settings, day: date, until:
     regime_latch = None if rebuild else _regime_latch(conn)
     if rebuild:
         conn.execute("UPDATE desk_state SET regime_latch = NULL WHERE player_id = ?", (_pid(),))
+        forget_policy(_pid())
     walked = 0
     logged = None
     after = int(applied.timestamp()) if applied is not None else None
@@ -1457,11 +1518,13 @@ def replay_until(conn: sqlite3.Connection, settings: Settings, day: date, until:
             )
             regime_latch = state.regime_latch or None
             width_choice = state.latest_wings or state.wings
+            shown = state.wings if state.wings != "auto" else str(wings_for_clock(wall))
+            note_policy(conn, ts, state.regime, int(state.stop), shown)
             if engine["auto_open"]:
                 strategy.f1_at = state.f1_at
         clock = _clock_text(ts)
         if leftover_long_rows(conn) and leftovers_sell_allowed(book_clock(ts), leftover_rules):
-            sold = sell_ready_leftovers(conn, settings, chain_asof(settings, day, ts))
+            sold = sell_ready_leftovers(conn, settings, chain_asof(settings, day, ts), leftover_rules, ts)
             if sold:
                 log.info("step %s sold %s leftover longs", clock, sold)
         strategy.on_quote(Quote(symbol="SPX", last=float(point["value"]), ts=ts))
@@ -1569,6 +1632,7 @@ def watch_frame(conn: sqlite3.Connection, settings: Settings, marks: DeskMarks) 
                 "btc": row.get("btc_actual"),
                 "pnl": row.get("pnl_mid"),
                 "dead_longs": row.get("dead_longs") or [],
+                "sales": row.get("sales") or [],
             }
         )
     return {
@@ -1685,6 +1749,10 @@ def session_step(conn: sqlite3.Connection, settings: Settings, marks: DeskMarks)
             raw_until = spec.auto.get("add_until")
             if raw_until:
                 strategy.add_until = time.fromisoformat(str(raw_until))
+            shown = state.wings if state.wings != "auto" else str(wings_for_clock(wall))
+            note_policy(conn, clock, state.regime, int(state.stop), shown)
+        else:
+            note_policy(conn, clock, str(engine["regime"]), int(engine["stop"]), str(engine["wings"]))
         wings = None if width_choice == "auto" else int(width_choice)
         intents = strategy.decide(spot, clock, wings=wings)
         filled = False
@@ -1748,6 +1816,115 @@ def _arm_clocks(
         strategy.f1_at = spec.f1_at
 
 
+def _buy_shorts_sell_live_wings(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    chain,
+    strike: float,
+    wings: int,
+    clock: str,
+    when: datetime | None = None,
+) -> tuple[float | None, int, str | None, list[dict]]:
+    """BTC the shorts and STC each wing that has a bid. Park the rest.
+
+    The sale is part of this stop, on the same print. Returns the debit before
+    slippage, the contracts traded, an error code, and the wings that sold.
+    """
+    sold, parked = live_wing_bids(chain, strike, wings)
+    mark = short_mark(chain, strike)
+    if mark is None:
+        return None, 0, "nomid", []
+    rejected = _send_shorts(settings, conn, chain, strike)
+    if rejected:
+        return None, 0, rejected, []
+    contracts = _SHORT_LEGS
+    filled: list[dict] = []
+    for lot in sold:
+        rejected = _send_one_long(settings, conn, str(lot["occ"]))
+        qty = int(lot.get("quantity") or 1)
+        if rejected:
+            parked.append(lot)
+            log.info(
+                "step %s long %s %s rejected %s",
+                clock,
+                lot["right"],
+                int(float(lot["strike"])),
+                rejected,
+            )
+            continue
+        mark = round(float(mark) - float(lot["bid"]) * qty, 2)
+        contracts += qty
+        filled.append(lot)
+        log.info(
+            "step %s sold long %s %s %.2f",
+            clock,
+            lot["right"],
+            int(float(lot["strike"])),
+            float(lot["bid"]),
+        )
+    if parked:
+        park_lots(conn, parked)
+        note = leftover_long_note(parked)
+        if note:
+            log.info("step %s %s", clock, note)
+    if when is not None:
+        note_event(conn, when, f"Closed straddle {int(strike)}")
+        for lot in filled:
+            note_event(
+                conn,
+                when,
+                f"Closed long {lot['right']} {int(float(lot['strike']))} at {float(lot['bid']):.2f}",
+            )
+        if parked:
+            strikes = " ".join(str(int(float(lot["strike"]))) for lot in parked)
+            note_event(conn, when, f"Parked longs {strikes}")
+    return float(mark), contracts, None, filled
+
+
+def _release_blocking_longs(conn, book, sales: list[dict], clock: str, when: datetime | None = None) -> None:
+    """STC parked longs that are the new short, and book each sale on its fly."""
+    if not sales:
+        return
+    release_longs(conn, sales)
+    fee = _fee_points(conn, 1)
+    for lot in sales:
+        _credit_wing_sale(book, lot, fee)
+        if when is not None:
+            note_event(
+                conn,
+                when,
+                f"Closed long {lot['right']} {int(float(lot['strike']))} at {float(lot['bid']):.2f}",
+            )
+        log.info(
+            "step %s sold long %s %s %.2f",
+            clock,
+            lot["right"],
+            int(float(lot["strike"])),
+            float(lot["bid"]),
+        )
+
+
+def _credit_wing_sale(book, lot: dict, fee_each: float) -> None:
+    """Take the wing sale off the closed fly's debit, net of one fee per contract."""
+    right = str(lot["right"])
+    strike = float(lot["strike"])
+    qty = int(lot.get("quantity") or 1)
+    points = float(lot["bid"]) * qty - fee_each * qty
+    owners = []
+    for fly in book.flies:
+        if fly.status != "closed" or fly.close_debit is None:
+            continue
+        wing = fly.strike + fly.wings if right == "call" else fly.strike - fly.wings
+        if int(round(wing)) == int(round(strike)):
+            owners.append(fly)
+    if not owners:
+        log.info("step wing sale %s %s %.2f has no closed fly", right, int(strike), points)
+        return
+    fly = max(owners, key=lambda item: item.closed_at or datetime.min.replace(tzinfo=_ET))
+    fly.close_debit = round(float(fly.close_debit) - points, 2)
+    _remember_sales(fly, [lot])
+
+
 def _fill_intent(
     conn: sqlite3.Connection,
     settings: Settings,
@@ -1772,9 +1949,9 @@ def _fill_intent(
     if chain is None and settings.desk_mode not in BOOK_FILLS:
         chain = chain_asof(settings, day, ts)
     if intent.kind is IntentKind.ADD:
-        fought = hold_conflict(conn, chain, strike)
-        if fought:
-            log.info("step %s fill open %s skipped %s", clock, int(strike), fought)
+        conflict, wing_sales = priced_short_conflicts(conn, chain, strike)
+        if conflict:
+            log.info("step %s fill open %s skipped %s", clock, int(strike), conflict)
             return False
         reused = reusable_wing_lots(conn, chain, strike, width)
         # Backtest books the chain mid. Refuse (and retry next tick) until every
@@ -1796,9 +1973,12 @@ def _fill_intent(
                 return False
             if reused is not None:
                 consume_wing_lots(conn, reused)
+            _release_blocking_longs(conn, strategy.book, wing_sales, clock, ts)
             intent.payload["credit"] = mark
             intent.payload["wings"] = width
             strategy.apply_intent(intent, ts)
+            kind = "Opened straddle" if reused is not None else "Opened fly"
+            note_event(conn, ts, f"{kind} {int(strike)} ({_fly_legs(strike, width)}) at {float(mark):.2f}")
             log.info(
                 "step %s fill open %s credit=%.2f wings=%s %s%s",
                 clock,
@@ -1823,9 +2003,11 @@ def _fill_intent(
                 )
                 return False
             consume_wing_lots(conn, reused)
+            _release_blocking_longs(conn, strategy.book, wing_sales, clock, ts)
             intent.payload["credit"] = mark
             intent.payload["wings"] = width
             strategy.apply_intent(intent, ts)
+            note_event(conn, ts, f"Opened straddle {int(strike)} ({_fly_legs(strike, width)}) at {float(mark):.2f}")
             log.info(
                 "step %s fill open %s credit=%.2f wings=%s reused longs",
                 clock,
@@ -1857,9 +2039,11 @@ def _fill_intent(
                     fill,
                 )
                 return False
+        _release_blocking_longs(conn, strategy.book, wing_sales, clock, ts)
         intent.payload["credit"] = mark
         intent.payload["wings"] = width
         strategy.apply_intent(intent, ts)
+        note_event(conn, ts, f"Opened fly {int(strike)} ({_fly_legs(strike, width)}) at {float(mark):.2f}")
         log.info(
             "step %s fill open %s credit=%.2f wings=%s %s",
             clock,
@@ -1874,21 +2058,19 @@ def _fill_intent(
         if fly is None:
             return False
         width = fly.wings
-        contracts = _SHORT_LEGS if dead_wings(chain, strike, width) else _FLY_LEGS
-        if contracts == _SHORT_LEGS:
-            mark = short_mark(chain, strike)
-            if mark is None:
+        if dead_wings(chain, strike, width):
+            mark, contracts, rejected, sold = _buy_shorts_sell_live_wings(
+                conn, settings, chain, strike, width, clock, ts
+            )
+            _remember_sales(fly, sold)
+            if rejected == "nomid" or mark is None:
                 log.info("step %s fill drop %s skipped no chain mid wings=%s", clock, int(strike), width)
                 return False
-            rejected = _send_shorts(settings, conn, chain, strike)
             if rejected:
                 log.info("step %s fill drop %s rejected %s", clock, int(strike), rejected)
                 return False
-            lots = park_wings(conn, chain, strike, width)
-            note = leftover_long_note(lots)
-            if note:
-                log.info("step %s %s", clock, note)
         else:
+            contracts = _FLY_LEGS
             rejected, fill = _send_live(settings, conn, chain, strike, width, closing=True)
             if rejected:
                 log.info("step %s fill drop %s rejected %s", clock, int(strike), rejected)
@@ -1913,6 +2095,8 @@ def _fill_intent(
                     )
                     return False
         mark = _add_close_slippage(conn, ts, mark, contracts)
+        if not dead_wings(chain, strike, width):
+            note_event(conn, ts, f"Closed fly {int(strike)} at {float(mark):.2f}")
         intent.payload["debit"] = mark
         intent.payload["wings"] = width
         strategy.apply_intent(intent, ts)
@@ -2234,9 +2418,10 @@ def _stamp_flies(data: dict, book: FlyBook, marks: DeskMarks, clock: datetime) -
     cash = book_clock(clock) >= _CASH_AT
     close = _cash_close(marks) if cash else None
     for row, fly in zip(paired, flies):
-        row["time_open"] = fly.opened_at.astimezone(_ET).strftime("%H:%M")
+        row["sales"] = _sale_rows(getattr(fly, "sales", []))
+        row["time_open"] = fly.opened_at.astimezone(_ET).strftime("%H:%M:%S")
         if fly.closed_at is not None:
-            row["time_close"] = fly.closed_at.astimezone(_ET).strftime("%H:%M")
+            row["time_close"] = fly.closed_at.astimezone(_ET).strftime("%H:%M:%S")
         settled = cash and close is not None and _settle_fly(fly)
         if settled:
             row["pnl_mid"] = round(
