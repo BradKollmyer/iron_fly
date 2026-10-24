@@ -168,6 +168,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE fly ADD COLUMN pnl REAL")
     if "sales_json" not in fly_columns:
         conn.execute("ALTER TABLE fly ADD COLUMN sales_json TEXT NOT NULL DEFAULT '[]'")
+    if "call_wings" not in fly_columns:
+        conn.execute("ALTER TABLE fly ADD COLUMN call_wings INTEGER")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS fly_history (

@@ -29,7 +29,7 @@ from iron_fly.desk import (
 )
 from iron_fly.domain.market import ChainSnapshot, DeskMarks, combo_mark, leg_book, straddle_book
 from iron_fly.market_feed import last_spx, read_chain
-from iron_fly.orders import leftover_long_rows, leftovers_sell_allowed, sell_ready_leftovers
+from iron_fly.orders import fly_spans, leftover_long_rows, leftovers_sell_allowed, sell_ready_leftovers
 from iron_fly.strategy.rules import book_clock
 
 log = logging.getLogger("iron_fly.step")
@@ -332,7 +332,8 @@ def _log_close_quote(clock: datetime, book, chain: ChainSnapshot) -> None:
         log.info("step %s close quote no open fly", stamp)
         return
     for fly in flies:
-        mark = combo_mark(chain, fly.strike, fly.wings)
+        put_w, call_w = fly_spans(fly)
+        mark = combo_mark(chain, fly.strike, put_w, call_w)
         pnl = None if mark is None else round(fly.credit - mark, 2)
         log.info(
             "step %s close quote %s mark=%s pnl=%s %s",
@@ -340,7 +341,7 @@ def _log_close_quote(clock: datetime, book, chain: ChainSnapshot) -> None:
             int(fly.strike),
             "—" if mark is None else f"{mark:.2f}",
             "—" if pnl is None else f"{pnl:.2f}",
-            leg_book(chain, fly.strike, fly.wings),
+            leg_book(chain, fly.strike, put_w, call_w),
         )
 
 
@@ -349,7 +350,8 @@ def _log_legs(clock: datetime, book, chain: ChainSnapshot) -> None:
     for fly in book.flies:
         if fly.status != "active":
             continue
-        log.info("step %s legs %s %s", stamp, int(fly.strike), leg_book(chain, fly.strike, fly.wings))
+        put_w, call_w = fly_spans(fly)
+        log.info("step %s legs %s %s", stamp, int(fly.strike), leg_book(chain, fly.strike, put_w, call_w))
 
 
 def _log(board: FlyBoard, clock: datetime, chain_label: str) -> None:

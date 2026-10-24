@@ -217,6 +217,75 @@ def test_add_logs_when_short_fights_an_open_fly_wing(tmp_path):
     conn.close()
 
 
+def test_add_widens_the_call_that_lands_on_a_short(tmp_path):
+    """7620 @ 20 wants the 7640 call that is already short. The call steps out to 7645."""
+    from iron_fly.desk import save_book
+    from iron_fly.orders import fly_spans
+
+    chain = ChainSnapshot(
+        ts=None,
+        expiration=None,
+        strikes=(
+            _strike(7600, (0.20, 0.30), (1.20, 1.40)),
+            _strike(7620, (8.00, 8.40), (7.00, 7.40)),
+            _strike(7640, (11.00, 11.40), (6.00, 6.40)),
+            _strike(7645, (0.40, 0.60), (0.20, 0.40)),
+            _strike(7690, (0.05, 0.15), (3.00, 3.20)),
+        ),
+    )
+    when = datetime(2026, 10, 23, 15, 52, 19, tzinfo=ET)
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    migrate(conn)
+    strategy = DaleOg()
+    strategy.book.open_fly(7640, 20.0, 50, when.replace(second=0))
+    intent = Intent(IntentKind.ADD, "watch tagged", {"strike": 7620.0, "wings": 20})
+    assert _fill_intent(conn, settings, date(2026, 10, 23), strategy, intent, when, 20, chain) is True
+    opened = next(fly for fly in strategy.book.active() if fly.strike == 7620)
+    assert fly_spans(opened) == (20, 25)
+    open_mode, _close_mode = _fill_modes(conn)
+    assert float(intent.payload["credit"]) == combo_fill(
+        chain, 7620, 20, side="open", mode=open_mode, call_wings=25
+    )
+    texts = [row["text"] for row in event_rows(conn)]
+    assert any("7600/7620/7645" in text for text in texts)
+    assert not any(text.startswith("Open blocked") for text in texts)
+    save_book(conn, strategy.book)
+    loaded = next(fly for fly in load_book(conn).active() if fly.strike == 7620)
+    assert fly_spans(loaded) == (20, 25)
+    conn.close()
+
+
+def test_add_stays_blocked_when_one_step_still_hits_a_short(tmp_path):
+    when = datetime(2026, 10, 23, 15, 52, 19, tzinfo=ET)
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    migrate(conn)
+    strategy = DaleOg()
+    strategy.book.open_fly(7640, 20.0, 50, when)
+    strategy.book.open_fly(7645, 20.0, 50, when)
+    intent = Intent(IntentKind.ADD, "watch tagged", {"strike": 7620.0, "wings": 20})
+    assert _fill_intent(conn, settings, date(2026, 10, 23), strategy, intent, when, 20, _wing_chain()) is False
+    assert [fly.strike for fly in strategy.book.active()] == [7640, 7645]
+    assert any(row["text"].startswith("Open blocked 7620 @ 20") for row in event_rows(conn))
+    conn.close()
+
+
+def test_widen_steps_the_put_and_leaves_a_short_overlap_blocked():
+    from iron_fly.orders import widen_blocked_open
+
+    when = datetime(2026, 10, 23, 15, 52, tzinfo=ET)
+    call_book = DaleOg()
+    call_book.book.open_fly(7640, 20.0, 50, when)
+    assert widen_blocked_open(call_book.book.active(), 7620, 20) == (20, 25)
+    put_book = DaleOg()
+    put_book.book.open_fly(7600, 20.0, 50, when)
+    assert widen_blocked_open(put_book.book.active(), 7620, 20) == (25, 20)
+    body = DaleOg()
+    body.book.open_fly(7640, 8.30, 20, when)
+    assert widen_blocked_open(body.book.active(), 7660, 20) is None
+
+
 def test_open_blocked_suggests_wider_wings_when_that_clears_the_book(tmp_path):
     from iron_fly.orders import load_open_conflict, open_book_hold, record_open_blocked
 

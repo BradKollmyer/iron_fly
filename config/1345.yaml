@@ -5,8 +5,8 @@ regime: "±15/20"            # grid until EM is published
 stop: 0                     # drop at the credit breakeven (K ± credit)
 em_regime: true             # current EM $ picks the row, and can widen again
 credit_regime: false        # the fill credit no longer sets the grid
-cookies_below: 50           # under this EM%, switch to the tight cookies grid
-cookies_min_flies: 1        # cookies only while at least this many flies are open
+cookies_below: 50           # under this EM%, switch to cookies and stay there
+cookies_min_flies: 1        # need this many open flies to enter cookies
 follow_wings: true          # from 9:35, width tracks the 0.40 put and never widens
 wing_steps: [50, 30, 20]    # widths follow_wings may snap to
 add_until: "16:00"          # no new fly from here; drops still run until 16:01

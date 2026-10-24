@@ -242,6 +242,14 @@ def _skip_dates(raw: str) -> set[date]:
     return found
 
 
+def _wings_label(fly: dict) -> str:
+    put = fly.get("wings")
+    call = fly.get("call_wings")
+    if call in (None, "", put):
+        return str(put)
+    return f"{put}/{call}"
+
+
 def _settings(data_dir: Path) -> Settings:
     return Settings.from_values(
         app_base_url="http://localhost:8001",
@@ -275,7 +283,7 @@ def _report(
         when = opens[index] if index < len(opens) else None
         em, pct = _reading_at(tape or [], when, stamps)
         lines.append(
-            f"  {fly.get('time_open') or '—':<8} {close:<8}  {strike}  wings {fly.get('wings')}  "
+            f"  {fly.get('time_open') or '—':<8} {close:<8}  {strike}  wings {_wings_label(fly)}  "
             f"sto {sto}  em {_quote(em):>6}  em% {_quote(pct):>5}  pnl {_dollars(fly.get('pnl'))}"
         )
     lines.append(f"P&L {_dollars(frame.get('pnl'))}")

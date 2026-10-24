@@ -33,7 +33,9 @@ from iron_fly.orders import (
     clear_open_conflict,
     load_open_conflict,
     open_book_hold,
+    fly_spans,
     record_open_blocked,
+    widen_blocked_open,
     release_longs,
     reusable_wing_lots,
     sell_ready_leftovers,
@@ -280,6 +282,24 @@ def _remember_sales(fly, lots: list[dict]) -> None:
     current.extend(rows)
 
 
+def _attach_call_wings(fly, call_wings: int | None) -> None:
+    """Remember a call wing that is wider or narrower than the put."""
+    if fly is None or call_wings is None or int(call_wings) == int(fly.wings):
+        return
+    fly.call_wings = int(call_wings)
+
+
+def _stored_call_wings(fly) -> int | None:
+    extra = getattr(fly, "call_wings", None)
+    if extra is None or int(extra) == int(fly.wings):
+        return None
+    return int(extra)
+
+
+def _active_fly(book: FlyBook, strike: float):
+    return next((fly for fly in book.active() if fly.strike == float(strike)), None)
+
+
 def load_book(conn: sqlite3.Connection) -> FlyBook:
     book = FlyBook()
     state = conn.execute("SELECT * FROM desk_state WHERE player_id = ?", (_pid(),)).fetchone()
@@ -290,6 +310,7 @@ def load_book(conn: sqlite3.Connection) -> FlyBook:
     rows = conn.execute("SELECT * FROM fly WHERE player_id = ? ORDER BY id", (_pid(),)).fetchall()
     for row in rows:
         opened = datetime.fromisoformat(row["opened_at"])
+        call_wings = row["call_wings"] if "call_wings" in row.keys() else None
         book.open_fly(
             float(row["strike"]),
             float(row["credit"]),
@@ -297,6 +318,7 @@ def load_book(conn: sqlite3.Connection) -> FlyBook:
             opened,
             origin=str(row["origin"] or ""),
         )
+        _attach_call_wings(book.flies[-1], None if call_wings is None else int(call_wings))
         if row["status"] == "closed" and row["close_debit"] is not None:
             closed = datetime.fromisoformat(row["closed_at"]) if row["closed_at"] else opened
             book.close_fly(float(row["strike"]), float(row["close_debit"]), closed)
@@ -311,9 +333,10 @@ def save_book(conn: sqlite3.Connection, book: FlyBook) -> None:
         conn.execute(
             """
             INSERT INTO fly (
-                player_id, strike, wings, credit, opened_at, status, close_debit, closed_at, origin, sales_json
+                player_id, strike, wings, credit, opened_at, status, close_debit, closed_at, origin, sales_json,
+                call_wings
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 pid,
@@ -326,6 +349,7 @@ def save_book(conn: sqlite3.Connection, book: FlyBook) -> None:
                 fly.closed_at.isoformat() if fly.closed_at else None,
                 fly.origin,
                 json.dumps(_sale_rows(getattr(fly, "sales", []))),
+                _stored_call_wings(fly),
             ),
         )
     conn.execute(
@@ -541,13 +565,17 @@ def open_strike(
     chain = marks.chain
     if settings.desk_mode in BACKTEST_MODES and day is not None:
         chain = chain_asof(settings, day, clock)
-    book_hold = open_book_hold(book.active(), strike, width)
-    if book_hold:
-        return _skip_open(conn, book, clock, strike, width, book_hold)
+    requested = width
+    chosen = widen_blocked_open(book.active(), strike, requested)
+    if chosen is None:
+        return _skip_open(
+            conn, book, clock, strike, requested, open_book_hold(book.active(), strike, requested) or ""
+        )
+    width, call_w = chosen
     conflict, wing_sales = priced_short_conflicts(conn, chain, strike)
     if conflict:
-        return _skip_open(conn, book, clock, strike, width, conflict)
-    reused = reusable_wing_lots(conn, chain, strike, width)
+        return _skip_open(conn, book, clock, strike, requested, conflict)
+    reused = reusable_wing_lots(conn, chain, strike, width, call_w)
     if reused is not None:
         rejected, fill = _send_open_shorts(settings, conn, chain, strike)
         if rejected:
@@ -562,12 +590,13 @@ def open_strike(
             return "nomid"
         consume_wing_lots(conn, reused)
         _release_blocking_longs(conn, book, wing_sales, _clock_text(clock), clock)
-        book.open_fly(strike, round(float(credit), 2), width, clock)
+        opened = book.open_fly(strike, round(float(credit), 2), width, clock)
+        _attach_call_wings(opened, call_w)
         clear_open_conflict(conn)
         note_event(
             conn,
             clock,
-            f"Opened straddle {int(strike)} ({_fly_legs(strike, width)}) at {float(credit):.2f}",
+            f"Opened straddle {int(strike)} ({_fly_legs(strike, width, call_w)}) at {float(credit):.2f}",
         )
         save_book(conn, book)
         log.info(
@@ -585,7 +614,7 @@ def open_strike(
     credit = _subtract_open_slippage(
         conn,
         clock,
-        _book_package_price(fill, credit, chain, strike, width, side="open", mode=open_mode),
+        _book_package_price(fill, credit, chain, strike, width, side="open", mode=open_mode, call_wings=call_w),
         _FLY_LEGS,
     )
     if credit is None or float(credit) <= MIN_OPEN_CREDIT:
@@ -598,7 +627,7 @@ def open_strike(
                 "step %s fill open %s deferred no quotes %s (retry)",
                 _clock_text(clock),
                 int(strike),
-                leg_book(chain, strike, width),
+                leg_book(chain, strike, width, call_w),
             )
             return "nomid"
         # Live order already accepted — never leave the blotter empty.
@@ -610,9 +639,10 @@ def open_strike(
         )
         credit = abs(float(fill))
     _release_blocking_longs(conn, book, wing_sales, _clock_text(clock), clock)
-    book.open_fly(strike, round(float(credit), 2), width, clock)
+    opened = book.open_fly(strike, round(float(credit), 2), width, clock)
+    _attach_call_wings(opened, call_w)
     clear_open_conflict(conn)
-    note_event(conn, clock, f"Opened fly {int(strike)} ({_fly_legs(strike, width)}) at {float(credit):.2f}")
+    note_event(conn, clock, f"Opened fly {int(strike)} ({_fly_legs(strike, width, call_w)}) at {float(credit):.2f}")
     save_book(conn, book)
     log.info(
         "step %s fill open %s credit=%.2f wings=%s",
@@ -690,6 +720,7 @@ def _book_package_price(
     *,
     side: str = "open",
     mode: str = "mid",
+    call_wings: int | None = None,
 ) -> float | None:
     """Positive package credit/debit for the blotter. Fills may be signed."""
     if fill is not None:
@@ -700,7 +731,7 @@ def _book_package_price(
         value = abs(float(preferred))
         if 0 < value <= 1000:
             return value
-    mark = combo_fill(chain, strike, width, side=side, mode=mode)
+    mark = combo_fill(chain, strike, width, side=side, mode=mode, call_wings=call_wings)
     if mark is not None and 0 < mark <= 1000:
         return float(mark)
     return None
@@ -768,10 +799,11 @@ def pause_auto_open(conn: sqlite3.Connection) -> None:
 
 def _close_open_fly(conn, settings: Settings, book: FlyBook, fly, chain, clock: datetime) -> str | None:
     """4-leg close, or BTC the shorts and sell each wing that still has a bid."""
-    notes = dead_wings(chain, fly.strike, fly.wings)
+    put_w, call_w = fly_spans(fly)
+    notes = dead_wings(chain, fly.strike, put_w, call_w)
     if notes:
         debit, contracts, rejected, sold = _buy_shorts_sell_live_wings(
-            conn, settings, chain, fly.strike, fly.wings, _clock_text(clock), clock
+            conn, settings, chain, fly.strike, put_w, _clock_text(clock), clock, call_wings=call_w
         )
         if rejected:
             return rejected
@@ -779,11 +811,13 @@ def _close_open_fly(conn, settings: Settings, book: FlyBook, fly, chain, clock: 
             return "nomid"
         _remember_sales(fly, sold)
     else:
-        rejected, fill = _send_live(settings, conn, chain, fly.strike, fly.wings, closing=True)
+        rejected, fill = _send_live(settings, conn, chain, fly.strike, put_w, closing=True)
         if rejected:
             return rejected
         _, close_mode = _fill_modes(conn)
-        debit = _book_package_price(fill, None, chain, fly.strike, fly.wings, side="close", mode=close_mode)
+        debit = _book_package_price(
+            fill, None, chain, fly.strike, put_w, side="close", mode=close_mode, call_wings=call_w
+        )
         if debit is None or float(debit) <= MIN_OPEN_CREDIT:
             if (
                 settings.desk_mode in BACKTEST_MODES
@@ -1646,6 +1680,7 @@ def watch_frame(conn: sqlite3.Connection, settings: Settings, marks: DeskMarks) 
                 "slot": row.get("slot"),
                 "strike": row.get("strike"),
                 "wings": row.get("put_wing"),
+                "call_wings": row.get("call_wing"),
                 "status": row.get("status"),
                 "time_open": row.get("time_open") or "",
                 "time_close": row.get("time_close") or "",
@@ -1847,13 +1882,14 @@ def _buy_shorts_sell_live_wings(
     wings: int,
     clock: str,
     when: datetime | None = None,
+    call_wings: int | None = None,
 ) -> tuple[float | None, int, str | None, list[dict]]:
     """BTC the shorts and STC each wing that has a bid. Park the rest.
 
     The sale is part of this stop, on the same print. Returns the debit before
     slippage, the contracts traded, an error code, and the wings that sold.
     """
-    sold, parked = live_wing_bids(chain, strike, wings)
+    sold, parked = live_wing_bids(chain, strike, wings, call_wings)
     mark = short_mark(chain, strike)
     if mark is None:
         return None, 0, "nomid", []
@@ -1937,7 +1973,8 @@ def _credit_wing_sale(book, lot: dict, fee_each: float) -> None:
     for fly in book.flies:
         if fly.status != "closed" or fly.close_debit is None:
             continue
-        wing = fly.strike + fly.wings if right == "call" else fly.strike - fly.wings
+        put_w, call_w = fly_spans(fly)
+        wing = fly.strike + call_w if right == "call" else fly.strike - put_w
         if int(round(wing)) == int(round(strike)):
             owners.append(fly)
     if not owners:
@@ -1972,24 +2009,27 @@ def _fill_intent(
     if chain is None and settings.desk_mode not in BOOK_FILLS:
         chain = chain_asof(settings, day, ts)
     if intent.kind is IntentKind.ADD:
-        book_hold = open_book_hold(strategy.book.active(), strike, width)
-        if book_hold:
-            record_open_blocked(conn, ts, strike, width, book_hold, strategy.book.active())
+        requested = width
+        chosen = widen_blocked_open(strategy.book.active(), strike, requested)
+        if chosen is None:
+            book_hold = open_book_hold(strategy.book.active(), strike, requested) or ""
+            record_open_blocked(conn, ts, strike, requested, book_hold, strategy.book.active())
             log.info("step %s fill open %s skipped %s", clock, int(strike), book_hold)
             return False
+        width, call_w = chosen
         conflict, wing_sales = priced_short_conflicts(conn, chain, strike)
         if conflict:
-            record_open_blocked(conn, ts, strike, width, conflict, strategy.book.active())
+            record_open_blocked(conn, ts, strike, requested, conflict, strategy.book.active())
             log.info("step %s fill open %s skipped %s", clock, int(strike), conflict)
             return False
-        reused = reusable_wing_lots(conn, chain, strike, width)
+        reused = reusable_wing_lots(conn, chain, strike, width, call_w)
         # Backtest books the chain mid. Refuse (and retry next tick) until every
         # leg is quoted — never STO at the 0.01 penny placeholder.
         if settings.desk_mode in BACKTEST_MODES:
             mark = _subtract_open_slippage(
                 conn,
                 ts,
-                _sim_open_credit(conn, chain, strike, width, reused=reused is not None),
+                _sim_open_credit(conn, chain, strike, width, reused=reused is not None, call_wings=call_w),
                 _SHORT_LEGS if reused is not None else _FLY_LEGS,
             )
             if mark is None:
@@ -1997,7 +2037,7 @@ def _fill_intent(
                     "step %s fill open %s deferred no quotes %s (retry)",
                     clock,
                     int(strike),
-                    leg_book(chain, strike, width),
+                    leg_book(chain, strike, width, call_w),
                 )
                 return False
             if reused is not None:
@@ -2005,17 +2045,19 @@ def _fill_intent(
             _release_blocking_longs(conn, strategy.book, wing_sales, clock, ts)
             intent.payload["credit"] = mark
             intent.payload["wings"] = width
+            intent.payload["call_wings"] = call_w
             strategy.apply_intent(intent, ts)
+            _attach_call_wings(_active_fly(strategy.book, strike), call_w)
             clear_open_conflict(conn)
             kind = "Opened straddle" if reused is not None else "Opened fly"
-            note_event(conn, ts, f"{kind} {int(strike)} ({_fly_legs(strike, width)}) at {float(mark):.2f}")
+            note_event(conn, ts, f"{kind} {int(strike)} ({_fly_legs(strike, width, call_w)}) at {float(mark):.2f}")
             log.info(
                 "step %s fill open %s credit=%.2f wings=%s %s%s",
                 clock,
                 int(strike),
                 mark,
                 width,
-                leg_book(chain, strike, width),
+                leg_book(chain, strike, width, call_w),
                 " reused longs" if reused is not None else "",
             )
             return True
@@ -2036,9 +2078,11 @@ def _fill_intent(
             _release_blocking_longs(conn, strategy.book, wing_sales, clock, ts)
             intent.payload["credit"] = mark
             intent.payload["wings"] = width
+            intent.payload["call_wings"] = call_w
             strategy.apply_intent(intent, ts)
+            _attach_call_wings(_active_fly(strategy.book, strike), call_w)
             clear_open_conflict(conn)
-            note_event(conn, ts, f"Opened straddle {int(strike)} ({_fly_legs(strike, width)}) at {float(mark):.2f}")
+            note_event(conn, ts, f"Opened straddle {int(strike)} ({_fly_legs(strike, width, call_w)}) at {float(mark):.2f}")
             log.info(
                 "step %s fill open %s credit=%.2f wings=%s reused longs",
                 clock,
@@ -2052,7 +2096,7 @@ def _fill_intent(
             log.info("step %s fill open %s rejected %s", clock, int(strike), rejected)
             return False
         open_mode, _ = _fill_modes(conn)
-        mark = _book_package_price(fill, None, chain, strike, width, side="open", mode=open_mode)
+        mark = _book_package_price(fill, None, chain, strike, width, side="open", mode=open_mode, call_wings=call_w)
         if mark is None or float(mark) <= MIN_OPEN_CREDIT:
             if fill is not None and abs(float(fill)) > MIN_OPEN_CREDIT:
                 log.error(
@@ -2073,26 +2117,28 @@ def _fill_intent(
         _release_blocking_longs(conn, strategy.book, wing_sales, clock, ts)
         intent.payload["credit"] = mark
         intent.payload["wings"] = width
+        intent.payload["call_wings"] = call_w
         strategy.apply_intent(intent, ts)
+        _attach_call_wings(_active_fly(strategy.book, strike), call_w)
         clear_open_conflict(conn)
-        note_event(conn, ts, f"Opened fly {int(strike)} ({_fly_legs(strike, width)}) at {float(mark):.2f}")
+        note_event(conn, ts, f"Opened fly {int(strike)} ({_fly_legs(strike, width, call_w)}) at {float(mark):.2f}")
         log.info(
             "step %s fill open %s credit=%.2f wings=%s %s",
             clock,
             int(strike),
             mark,
             width,
-            leg_book(chain, strike, width),
+            leg_book(chain, strike, width, call_w),
         )
         return True
     if intent.kind is IntentKind.CLOSE:
         fly = next((item for item in strategy.book.active() if item.strike == strike), None)
         if fly is None:
             return False
-        width = fly.wings
-        if dead_wings(chain, strike, width):
+        width, call_w = fly_spans(fly)
+        if dead_wings(chain, strike, width, call_w):
             mark, contracts, rejected, sold = _buy_shorts_sell_live_wings(
-                conn, settings, chain, strike, width, clock, ts
+                conn, settings, chain, strike, width, clock, ts, call_wings=call_w
             )
             _remember_sales(fly, sold)
             if rejected == "nomid" or mark is None:
@@ -2108,7 +2154,9 @@ def _fill_intent(
                 log.info("step %s fill drop %s rejected %s", clock, int(strike), rejected)
                 return False
             _, close_mode = _fill_modes(conn)
-            mark = _book_package_price(fill, None, chain, strike, width, side="close", mode=close_mode)
+            mark = _book_package_price(
+                fill, None, chain, strike, width, side="close", mode=close_mode, call_wings=call_w
+            )
             if mark is None or float(mark) <= MIN_OPEN_CREDIT:
                 if fill is not None and abs(float(fill)) > MIN_OPEN_CREDIT:
                     log.error(
@@ -2127,7 +2175,7 @@ def _fill_intent(
                     )
                     return False
         mark = _add_close_slippage(conn, ts, mark, contracts)
-        if not dead_wings(chain, strike, width):
+        if not dead_wings(chain, strike, width, call_w):
             note_event(conn, ts, f"Closed fly {int(strike)} at {float(mark):.2f}")
         intent.payload["debit"] = mark
         intent.payload["wings"] = width
@@ -2138,7 +2186,7 @@ def _fill_intent(
             int(strike),
             mark,
             width,
-            leg_book(chain, strike, width),
+            leg_book(chain, strike, width, call_w),
         )
         return True
     return False
@@ -2190,12 +2238,15 @@ def _sim_open_credit(
     width: int,
     *,
     reused: bool,
+    call_wings: int | None = None,
 ) -> float | None:
     """Chain credit for a backtest open. None until every needed leg is quoted."""
     if reused:
         return _straddle_credit(None, chain, strike)
     open_mode, _ = _fill_modes(conn)
-    mark = _book_package_price(None, None, chain, strike, width, side="open", mode=open_mode)
+    mark = _book_package_price(
+        None, None, chain, strike, width, side="open", mode=open_mode, call_wings=call_wings
+    )
     if mark is None or float(mark) <= MIN_OPEN_CREDIT:
         return None
     return float(mark)
@@ -2234,15 +2285,17 @@ def _buy_shorts_then_wings(conn, settings: Settings, fly, chain, clock: datetime
     rejected = _send_shorts(settings, conn, chain, fly.strike, expiration=when)
     if rejected:
         return fly.credit, rejected
-    _sell_each_long(conn, settings, chain, fly.strike, fly.wings, when, clock)
+    put_w, call_w = fly_spans(fly)
+    _sell_each_long(conn, settings, chain, fly.strike, put_w, when, clock, call_wings=call_w)
     _, close_mode = _fill_modes(conn)
-    debit = combo_fill(chain, fly.strike, fly.wings, side="close", mode=close_mode)
+    debit = combo_fill(chain, fly.strike, put_w, side="close", mode=close_mode, call_wings=call_w)
     if debit is None:
         debit = float(fly.credit)
     return debit, None
 
 
-def _built_wings(expiration: date, strike: float, wings: int) -> list[dict]:
+def _built_wings(expiration: date, strike: float, wings: int, call_wings: int | None = None) -> list[dict]:
+    call = strike + (wings if call_wings is None else call_wings)
     return [
         {
             "occ": spxw_symbol(expiration, "put", strike - wings),
@@ -2251,9 +2304,9 @@ def _built_wings(expiration: date, strike: float, wings: int) -> list[dict]:
             "quantity": 1,
         },
         {
-            "occ": spxw_symbol(expiration, "call", strike + wings),
+            "occ": spxw_symbol(expiration, "call", call),
             "right": "call",
-            "strike": float(strike + wings),
+            "strike": float(call),
             "quantity": 1,
         },
     ]
@@ -2272,11 +2325,18 @@ def _send_shorts(
 
 
 def _sell_each_long(
-    conn, settings: Settings, chain, strike: float, wings: int, expiration: date, clock: datetime
+    conn,
+    settings: Settings,
+    chain,
+    strike: float,
+    wings: int,
+    expiration: date,
+    clock: datetime,
+    call_wings: int | None = None,
 ) -> None:
     """STC each long by itself. A wing with no bid stays parked."""
     parked = []
-    for lot in _built_wings(expiration, strike, wings):
+    for lot in _built_wings(expiration, strike, wings, call_wings):
         symbol = _quoted_symbol(chain, str(lot["right"]), float(lot["strike"])) or str(lot["occ"])
         lot["occ"] = symbol
         reason = _no_bid(chain, str(lot["right"]), float(lot["strike"]))
@@ -2430,12 +2490,13 @@ def _stamp_flies(data: dict, book: FlyBook, marks: DeskMarks, clock: datetime) -
     flies = list(book.flies)
     while len(paired) < len(flies):
         fly = flies[len(paired)]
+        put_w, call_w = fly_spans(fly)
         row = {
             "slot": len(paired) + 1,
             "strike": fly.strike,
             "status": "closed" if fly.status == "closed" else "active",
-            "put_wing": fly.wings,
-            "call_wing": fly.wings,
+            "put_wing": put_w,
+            "call_wing": call_w,
             "sto": fly.credit,
             "btc_actual": fly.close_debit,
             "net": fly.net,
@@ -2456,17 +2517,20 @@ def _stamp_flies(data: dict, book: FlyBook, marks: DeskMarks, clock: datetime) -
             row["time_close"] = fly.closed_at.astimezone(_ET).strftime("%H:%M:%S")
         settled = cash and close is not None and _settle_fly(fly)
         if settled:
+            put_w, call_w = fly_spans(fly)
             row["pnl_mid"] = round(
-                fly_expiration_pnl(close, fly.strike, fly.credit, fly.wings, fly.wings),
+                fly_expiration_pnl(close, fly.strike, fly.credit, put_w, call_w),
                 2,
             )
         elif fly.status == "closed" and fly.net is not None:
             row["pnl_mid"] = fly.net
         else:
-            mark = combo_mark(marks.chain, fly.strike, fly.wings)
+            put_w, call_w = fly_spans(fly)
+            mark = combo_mark(marks.chain, fly.strike, put_w, call_w)
             row["pnl_mid"] = None if mark is None else round(fly.credit - mark, 2)
         if fly.status == "active":
-            row["dead_longs"] = dead_wings(marks.chain, fly.strike, fly.wings)
+            put_w, call_w = fly_spans(fly)
+            row["dead_longs"] = dead_wings(marks.chain, fly.strike, put_w, call_w)
         else:
             row["dead_longs"] = []
         if row["pnl_mid"] is not None:

@@ -76,9 +76,21 @@ def event_rows(conn: sqlite3.Connection) -> list[dict]:
     return [{"at": str(row["happened_at"]), "text": str(row["body"])} for row in rows]
 
 
-def _fly_legs(strike: float, wings: int) -> str:
+def _call_width(wings: int, call_wings: int | None = None) -> int:
+    return int(wings if call_wings is None else call_wings)
+
+
+def fly_spans(fly) -> tuple[int, int]:
+    """Put width and call width. A fly with no call width is symmetric."""
+    put = int(fly.wings)
+    extra = getattr(fly, "call_wings", None)
+    return put, _call_width(put, None if extra is None else int(extra))
+
+
+def _fly_legs(strike: float, wings: int, call_wings: int | None = None) -> str:
     center = int(round(strike))
-    return f"{int(round(strike - wings))}/{center}/{int(round(strike + wings))}"
+    call = int(round(strike + _call_width(wings, call_wings)))
+    return f"{int(round(strike - wings))}/{center}/{call}"
 
 
 def dead_reason(bid: float | None, ask: float | None) -> str | None:
@@ -94,10 +106,16 @@ def dead_reason(bid: float | None, ask: float | None) -> str | None:
     return None
 
 
-def dead_wings(chain: ChainSnapshot | None, strike: float, wings: int) -> list[str]:
+def dead_wings(
+    chain: ChainSnapshot | None,
+    strike: float,
+    wings: int,
+    call_wings: int | None = None,
+) -> list[str]:
     """Labels for long wings that cannot STC. Empty when both wings still trade."""
     notes = []
-    for right, wing in (("put", strike - wings), ("call", strike + wings)):
+    call = strike + _call_width(wings, call_wings)
+    for right, wing in (("put", strike - wings), ("call", call)):
         row = _row(chain, wing)
         reason = "no quote" if row is None else dead_reason(*_side(row, right))
         if reason:
@@ -135,10 +153,16 @@ def short_mark(chain: ChainSnapshot | None, strike: float) -> float | None:
     return round(call + put, 2)
 
 
-def wing_lots(chain: ChainSnapshot | None, strike: float, wings: int) -> list[dict]:
+def wing_lots(
+    chain: ChainSnapshot | None,
+    strike: float,
+    wings: int,
+    call_wings: int | None = None,
+) -> list[dict]:
     """The two long wings, one row per OCC."""
     lots = []
-    for right, wing in (("put", strike - wings), ("call", strike + wings)):
+    call = strike + _call_width(wings, call_wings)
+    for right, wing in (("put", strike - wings), ("call", call)):
         row = _row(chain, wing)
         lots.append(
             {
@@ -151,15 +175,22 @@ def wing_lots(chain: ChainSnapshot | None, strike: float, wings: int) -> list[di
     return lots
 
 
-def park_wings(conn: sqlite3.Connection, chain: ChainSnapshot | None, strike: float, wings: int) -> list[dict]:
+def park_wings(
+    conn: sqlite3.Connection,
+    chain: ChainSnapshot | None,
+    strike: float,
+    wings: int,
+    call_wings: int | None = None,
+) -> list[dict]:
     """Remember the wings a shorts-only close left behind. One row per OCC."""
-    return park_lots(conn, wing_lots(chain, strike, wings))
+    return park_lots(conn, wing_lots(chain, strike, wings, call_wings))
 
 
 def live_wing_bids(
     chain: ChainSnapshot | None,
     strike: float,
     wings: int,
+    call_wings: int | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Wings to sell at the bid, and wings to park.
 
@@ -168,7 +199,7 @@ def live_wing_bids(
     """
     sell: list[dict] = []
     park: list[dict] = []
-    for lot in wing_lots(chain, strike, wings):
+    for lot in wing_lots(chain, strike, wings, call_wings):
         bid = _positive_bid(chain, str(lot["right"]), float(lot["strike"]))
         if bid is None:
             park.append(lot)
@@ -189,6 +220,7 @@ def reusable_wing_lots(
     chain: ChainSnapshot | None,
     strike: float,
     wings: int,
+    call_wings: int | None = None,
 ) -> list[dict] | None:
     """Both parked wing longs for this fly, or None if either is missing."""
     parked = leftover_long_rows(conn)
@@ -197,7 +229,7 @@ def reusable_wing_lots(
     by_key = {(str(lot["right"]), int(lot["strike"])): lot for lot in parked}
     by_occ = {str(lot["occ"]): lot for lot in parked}
     matched: list[dict] = []
-    for need in wing_lots(chain, strike, wings):
+    for need in wing_lots(chain, strike, wings, call_wings):
         lot = by_key.get((str(need["right"]), int(need["strike"])))
         if lot is None:
             lot = by_occ.get(str(need["occ"]))
@@ -330,19 +362,19 @@ def _conflicting_lots(conn: sqlite3.Connection, chain: ChainSnapshot | None, str
     return hits
 
 
-def open_book_hold(active, strike: float, wings: int) -> str | None:
+def open_book_hold(active, strike: float, wings: int, call_wings: int | None = None) -> str | None:
     """Refuse when a new fly would short an open fly's wing or long a body short."""
     body = int(round(strike))
     put_wing = int(round(strike - wings))
-    call_wing = int(round(strike + wings))
+    call_wing = int(round(strike + _call_width(wings, call_wings)))
     parts: list[str] = []
     for fly in active:
         center = int(round(fly.strike))
-        span = int(fly.wings)
-        if body == center - span:
-            parts.append(f"short {body} put vs long put on {center}/{span}")
-        if body == center + span:
-            parts.append(f"short {body} call vs long call on {center}/{span}")
+        put_span, call_span = fly_spans(fly)
+        if body == center - put_span:
+            parts.append(f"short {body} put vs long put on {center}/{put_span}")
+        if body == center + call_span:
+            parts.append(f"short {body} call vs long call on {center}/{call_span}")
         if put_wing == center:
             parts.append(f"long put {put_wing} vs short put on {center}")
         if call_wing == center:
@@ -350,6 +382,35 @@ def open_book_hold(active, strike: float, wings: int) -> str | None:
     if not parts:
         return None
     return "; ".join(parts) + ". " + HOLD_CONFLICT
+
+
+WIDEN_STEP = 5
+
+
+def widen_blocked_open(active, strike: float, wings: int) -> tuple[int, int] | None:
+    """Put and call widths for this open.
+
+    A long wing that lands on an open short steps out by 5. None when that
+    step still overlaps the book, or when the new short is the overlap.
+    """
+    width = int(wings)
+    if open_book_hold(active, strike, width) is None:
+        return width, width
+    put_w, call_w = width, width
+    if _long_hits_short(active, strike - width):
+        put_w += WIDEN_STEP
+    if _long_hits_short(active, strike + width):
+        call_w += WIDEN_STEP
+    if put_w == width and call_w == width:
+        return None
+    if open_book_hold(active, strike, put_w, call_w) is not None:
+        return None
+    return put_w, call_w
+
+
+def _long_hits_short(active, wing: float) -> bool:
+    strike = int(round(wing))
+    return any(int(round(fly.strike)) == strike for fly in active)
 
 
 def clear_open_conflict(conn: sqlite3.Connection) -> None:

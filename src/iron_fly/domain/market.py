@@ -73,17 +73,28 @@ def _side(row: StrikeQuote | None, strike: float, right: str) -> str:
     return f"{name}{right} {_px(bid)}/{_px(ask)}"
 
 
-def leg_book(chain: ChainSnapshot | None, strike: float, wings: int) -> str:
+def _put_call(strike: float, wings: int, call_wings: int | None = None) -> tuple[float, float]:
+    call = wings if call_wings is None else call_wings
+    return strike - wings, strike + call
+
+
+def leg_book(
+    chain: ChainSnapshot | None,
+    strike: float,
+    wings: int,
+    call_wings: int | None = None,
+) -> str:
     """Bid/ask for the short call, short put, call wing, and put wing."""
+    put_strike, call_strike = _put_call(strike, wings, call_wings)
     center = _row(chain, strike) if chain is not None else None
-    call_wing = _row(chain, strike + wings) if chain is not None else None
-    put_wing = _row(chain, strike - wings) if chain is not None else None
+    call_wing = _row(chain, call_strike) if chain is not None else None
+    put_wing = _row(chain, put_strike) if chain is not None else None
     return " ".join(
         (
             _side(center, strike, "C"),
             _side(center, strike, "P"),
-            _side(call_wing, strike + wings, "C"),
-            _side(put_wing, strike - wings, "P"),
+            _side(call_wing, call_strike, "C"),
+            _side(put_wing, put_strike, "P"),
         )
     )
 
@@ -94,22 +105,33 @@ def straddle_book(chain: ChainSnapshot | None, strike: float) -> str:
     return f"{_side(row, strike, 'C')} {_side(row, strike, 'P')}"
 
 
-def combo_mark(chain: ChainSnapshot | None, strike: float, wings: int) -> float | None:
+def combo_mark(
+    chain: ChainSnapshot | None,
+    strike: float,
+    wings: int,
+    call_wings: int | None = None,
+) -> float | None:
     """Credit to open, or debit to close, the same 4-leg fly. Shorts minus wings."""
-    legs = _combo_legs(chain, strike, wings)
+    legs = _combo_legs(chain, strike, wings, call_wings)
     if legs is None:
         return None
     short_call, short_put, long_call, long_put = legs
     return round(short_call + short_put - long_call - long_put, 2)
 
 
-def combo_quote(chain: ChainSnapshot | None, strike: float, wings: int) -> tuple[float, float, float] | None:
+def combo_quote(
+    chain: ChainSnapshot | None,
+    strike: float,
+    wings: int,
+    call_wings: int | None = None,
+) -> tuple[float, float, float] | None:
     """Combo credit bid, mid, and ask. Bid sells the shorts and lifts the wings."""
     if chain is None:
         return None
+    put_strike, call_strike = _put_call(strike, wings, call_wings)
     center = _row(chain, strike)
-    put_wing = _row(chain, strike - wings)
-    call_wing = _row(chain, strike + wings)
+    put_wing = _row(chain, put_strike)
+    call_wing = _row(chain, call_strike)
     if center is None or put_wing is None or call_wing is None:
         return None
     prices = (
@@ -124,7 +146,7 @@ def combo_quote(chain: ChainSnapshot | None, strike: float, wings: int) -> tuple
     )
     if any(price is None for price in prices):
         return None
-    mark = combo_mark(chain, strike, wings)
+    mark = combo_mark(chain, strike, wings, call_wings)
     if mark is None:
         return None
     bid = round(float(center.call_bid) + float(center.put_bid) - float(call_wing.call_ask) - float(put_wing.put_ask), 2)
@@ -139,6 +161,7 @@ def combo_fill(
     *,
     side: str,
     mode: str,
+    call_wings: int | None = None,
 ) -> float | None:
     """Book price for an open or close. Falls back to mid when the quote is thin.
 
@@ -148,20 +171,26 @@ def combo_fill(
     """
     del side
     if mode != "bid" and mode != "ask":
-        return combo_mark(chain, strike, wings)
-    quote = combo_quote(chain, strike, wings)
+        return combo_mark(chain, strike, wings, call_wings)
+    quote = combo_quote(chain, strike, wings, call_wings)
     if quote is None:
-        return combo_mark(chain, strike, wings)
+        return combo_mark(chain, strike, wings, call_wings)
     bid, _mark, ask = quote
     return bid if mode == "bid" else ask
 
 
-def _combo_legs(chain: ChainSnapshot | None, strike: float, wings: int) -> tuple[float, float, float, float] | None:
+def _combo_legs(
+    chain: ChainSnapshot | None,
+    strike: float,
+    wings: int,
+    call_wings: int | None = None,
+) -> tuple[float, float, float, float] | None:
     if chain is None:
         return None
+    put_strike, call_strike = _put_call(strike, wings, call_wings)
     center = _row(chain, strike)
-    put_wing = _row(chain, strike - wings)
-    call_wing = _row(chain, strike + wings)
+    put_wing = _row(chain, put_strike)
+    call_wing = _row(chain, call_strike)
     if center is None or put_wing is None or call_wing is None:
         return None
     short_call = mid(center.call_bid, center.call_ask)
