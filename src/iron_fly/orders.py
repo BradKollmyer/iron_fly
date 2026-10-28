@@ -141,11 +141,15 @@ def dead_long_banner(flies: list[dict]) -> list[dict]:
     return out
 
 
-def short_mark(chain: ChainSnapshot | None, strike: float) -> float | None:
-    """Debit to buy back the two shorts."""
+def short_mark(chain: ChainSnapshot | None, strike: float, *, mode: str = "mid") -> float | None:
+    """Short-straddle price at the requested side; midpoint remains the default."""
     row = _row(chain, strike)
     if row is None:
         return None
+    if mode == "ask":
+        if row.call_ask is None or row.put_ask is None or row.call_ask <= 0 or row.put_ask <= 0:
+            return None
+        return round(row.call_ask + row.put_ask, 2)
     call = mid(row.call_bid, row.call_ask)
     put = mid(row.put_bid, row.put_ask)
     if call is None or put is None:
