@@ -29,6 +29,8 @@ from iron_fly.orders import (
     leftovers_sell_allowed,
     live_wing_bids,
     park_lots,
+    parked_cash_points,
+    parked_long_value,
     priced_short_conflicts,
     clear_open_conflict,
     load_open_conflict,
@@ -39,6 +41,7 @@ from iron_fly.orders import (
     release_longs,
     reusable_wing_lots,
     sell_ready_leftovers,
+    settle_parked_longs,
     short_mark,
 )
 from iron_fly.quotes.replay import (
@@ -484,6 +487,17 @@ def sheet(
         data = book.live_strip(spot, clock)
     ensure_cash_close(conn, settings, marks, clock)
     _stamp_flies(data, book, marks, clock)
+    cash_points = parked_cash_points(conn, clock.date().isoformat())
+    parked_value = parked_long_value(
+        conn, marks.chain, _cash_close(marks) if book_clock(clock) >= _CASH_AT else None
+    )
+    data["parked_cash_points"] = cash_points
+    data["parked_value_points"] = parked_value
+    fly_total = data.get("pnl_mid_total")
+    if parked_value is None:
+        data["pnl_mid_total"] = None
+    elif fly_total is not None or cash_points or parked_value:
+        data["pnl_mid_total"] = round((fly_total or 0) + cash_points + parked_value, 4)
     data["em_open"] = marks.em_open
     data["em_now"] = marks.em_now
     data["em_pct"] = marks.em_pct
@@ -1103,6 +1117,10 @@ def clear_flies(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM leftover_long WHERE player_id = ?", (_pid(),))
     conn.execute("DELETE FROM leftover_roll WHERE player_id = ?", (_pid(),))
     conn.execute("DELETE FROM desk_event WHERE player_id = ?", (_pid(),))
+    conn.execute(
+        "DELETE FROM parked_cashflow WHERE player_id = ? AND session_day = "
+        "(SELECT book_day FROM desk_state WHERE player_id = ?)", (_pid(), _pid()),
+    )
     forget_policy(_pid())
     conn.execute("DELETE FROM replay_pending_close WHERE player_id = ?", (_pid(),))
     conn.execute(
@@ -1189,6 +1207,9 @@ def _book_session_day(conn: sqlite3.Connection) -> str | None:
 
 def _archive_flies(conn: sqlite3.Connection, session_day: str) -> int:
     pid = _pid()
+    close = _load_cash_close(conn, session_day)
+    if close is not None:
+        settle_parked_longs(conn, session_day, close)
     conn.execute(
         """
         INSERT INTO fly_history (
@@ -1558,6 +1579,13 @@ def replay_until(conn: sqlite3.Connection, settings: Settings, day: date, until:
     for point in points:
         ts = datetime.fromtimestamp(int(point["time"]), tz=_ET)
         wall = book_clock(ts)
+        # Fill slippage evaluates EM picks from desk_state, just like a clock
+        # pick. Publish this print before any fills, and clear missing readings
+        # so an earlier low EM cannot keep a pick active through a data gap.
+        conn.execute(
+            "UPDATE desk_state SET em_pct = ?, em_now = ? WHERE player_id = ?",
+            (_point_num(point.get("pct")), _point_num(point.get("em")), _pid()),
+        )
         if spec is not None:
             pct = _point_num(point.get("pct"))
             em_value = _point_num(point.get("em"))
@@ -1765,6 +1793,8 @@ def watch_frame(conn: sqlite3.Connection, settings: Settings, marks: DeskMarks) 
         "dead_longs": model.get("dead_longs") or [],
         "open_conflict": model.get("open_conflict"),
         "pnl": model.get("pnl_mid_total"),
+        "parked_cash_points": model.get("parked_cash_points"),
+        "parked_value_points": model.get("parked_value_points"),
         "last": model.get("last_price"),
         "em_open": model.get("em_open"),
         "em_now": model.get("em_now"),
@@ -1944,7 +1974,8 @@ def _buy_shorts_sell_live_wings(
     slippage, the contracts traded, an error code, and the wings that sold.
     """
     sold, parked = live_wing_bids(chain, strike, wings, call_wings)
-    mark = short_mark(chain, strike)
+    _, close_mode = _fill_modes(conn)
+    mark = short_mark(chain, strike, mode=close_mode)
     if mark is None:
         return None, 0, "nomid", []
     rejected = _send_shorts(settings, conn, chain, strike)

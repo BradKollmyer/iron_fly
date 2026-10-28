@@ -163,6 +163,20 @@ def migrate(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS parked_cashflow (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id TEXT NOT NULL,
+            session_day TEXT NOT NULL,
+            happened_at TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            occ TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            amount_usd_cents INTEGER NOT NULL
+        )
+        """
+    )
     fly_columns = {row[1] for row in conn.execute("PRAGMA table_info(fly)")}
     if "pnl" not in fly_columns:
         conn.execute("ALTER TABLE fly ADD COLUMN pnl REAL")

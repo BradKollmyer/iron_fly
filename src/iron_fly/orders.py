@@ -12,11 +12,14 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, time
+from decimal import ROUND_HALF_UP, Decimal
+from zoneinfo import ZoneInfo
 
 from iron_fly.config import Settings
 from iron_fly.domain.market import ChainSnapshot, StrikeQuote, mid
-from iron_fly.strategy.spec import leftover_until_clock
+from iron_fly.strategy.spec import leftover_until_clock, parse_spec
 
 log = logging.getLogger("iron_fly.step")
 
@@ -141,11 +144,15 @@ def dead_long_banner(flies: list[dict]) -> list[dict]:
     return out
 
 
-def short_mark(chain: ChainSnapshot | None, strike: float) -> float | None:
-    """Debit to buy back the two shorts."""
+def short_mark(chain: ChainSnapshot | None, strike: float, *, mode: str = "mid") -> float | None:
+    """Short-straddle price at the requested side; midpoint remains the default."""
     row = _row(chain, strike)
     if row is None:
         return None
+    if mode == "ask":
+        if row.call_ask is None or row.put_ask is None or row.call_ask <= 0 or row.put_ask <= 0:
+            return None
+        return round(row.call_ask + row.put_ask, 2)
     call = mid(row.call_bid, row.call_ask)
     put = mid(row.put_bid, row.put_ask)
     if call is None or put is None:
@@ -595,9 +602,19 @@ def _roll_leftover(
     closed = str(lot["occ"])
     if opened == closed:
         return False
-    quantity = int(lot["quantity"])
+    held = next((item for item in leftover_long_rows(conn) if item["occ"] == closed), None)
+    if held is None:
+        return False
+    old = _row(chain, float(held["strike"]))
+    bid = None if old is None else _side(old, right)[0]
+    ask = None if row is None else _side(row, right)[1]
+    if bid is None or bid <= 0 or ask is None or ask <= 0:
+        return False
+    quantity = int(held["quantity"])
     origin = float(lot["strike"])
-    _replace_leftover(conn, closed, opened, right, target, quantity, origin)
+    with _parked_transaction(conn):
+        _replace_leftover(conn, closed, opened, right, target, quantity, origin)
+        _record_parked_cash(conn, when, "roll", closed, quantity, bid - ask, 2)
     stored = None if mark is None else round(float(mark), 2)
     conn.execute(
         """
@@ -653,10 +670,14 @@ def close_leftover_long(
     bid, _ask = (None, None) if row is None else _side(row, str(lot["right"]))
     if bid is None or bid <= 0:
         return "nobid"
-    conn.execute(
-        "DELETE FROM leftover_long WHERE player_id = ? AND occ = ?",
-        (_pid(), occ),
-    )
+    with _parked_transaction(conn):
+        deleted = conn.execute(
+            "DELETE FROM leftover_long WHERE player_id = ? AND occ = ?",
+            (_pid(), occ),
+        ).rowcount
+        if not deleted:
+            return "missing"
+        _record_parked_cash(conn, when, "sale", occ, int(lot["quantity"]), bid, 1)
     note_event(
         conn,
         when or datetime.now(),
@@ -664,6 +685,75 @@ def close_leftover_long(
     )
     log.info("step sold leftover long %s %s", lot["right"], int(lot["strike"]))
     return None
+
+
+@contextmanager
+def _parked_transaction(conn: sqlite3.Connection):
+    """Keep inventory and its cash entry together without committing the caller's book."""
+    conn.execute("SAVEPOINT parked_inventory_cash")
+    try:
+        yield
+    except Exception:
+        conn.execute("ROLLBACK TO parked_inventory_cash")
+        conn.execute("RELEASE parked_inventory_cash")
+        raise
+    else:
+        conn.execute("RELEASE parked_inventory_cash")
+
+
+def _record_parked_cash(conn, when, kind, occ, quantity, points, legs):
+    clock = when or datetime.now(ZoneInfo("America/New_York"))
+    day = clock.astimezone(ZoneInfo("America/New_York")).date() if clock.tzinfo else clock.date()
+    state = conn.execute("SELECT spec_yaml FROM desk_state WHERE player_id = ?", (_pid(),)).fetchone()
+    fee = Decimal(0)
+    if state is not None and state["spec_yaml"]:
+        fee = Decimal(str(parse_spec(state["spec_yaml"]).fee_per_contract))
+    # Option points -> dollars -> integer dollar cents; preserve sub-point fees.
+    dollars = Decimal(str(points)) * quantity * 100 - fee * quantity * legs
+    cents = int((dollars * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+    conn.execute(
+        "INSERT INTO desk_state (player_id, book_day) VALUES (?, ?) "
+        "ON CONFLICT(player_id) DO UPDATE SET book_day = COALESCE(book_day, excluded.book_day)",
+        (_pid(), day.isoformat()),
+    )
+    conn.execute(
+        "INSERT INTO parked_cashflow "
+        "(player_id, session_day, happened_at, kind, occ, quantity, amount_usd_cents) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (_pid(), day.isoformat(), clock.isoformat(), kind, occ, quantity, cents),
+    )
+
+
+def parked_cash_points(conn: sqlite3.Connection, session_day: str) -> float:
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount_usd_cents), 0) FROM parked_cashflow "
+        "WHERE player_id = ? AND session_day = ?", (_pid(), session_day),
+    ).fetchone()
+    return int(row[0]) / 10_000
+
+
+def settle_parked_longs(conn: sqlite3.Connection, session_day: str, cash_close: float) -> None:
+    """Retain known expiry proceeds in the dated ledger before inventory is archived."""
+    clock = datetime.fromisoformat(f"{session_day}T16:00:00").replace(tzinfo=ZoneInfo("America/New_York"))
+    for lot in leftover_long_rows(conn):
+        intrinsic = cash_close - float(lot["strike"])
+        points = max(0.0, intrinsic if lot["right"] == "call" else -intrinsic)
+        _record_parked_cash(conn, clock, "settlement", lot["occ"], int(lot["quantity"]), points, 0)
+
+
+def parked_long_value(conn: sqlite3.Connection, chain, cash_close: float | None = None) -> float | None:
+    value = 0.0
+    for lot in leftover_long_rows(conn):
+        if cash_close is not None:
+            intrinsic = cash_close - float(lot["strike"])
+            mark = max(0.0, intrinsic if lot["right"] == "call" else -intrinsic)
+        else:
+            row = _row(chain, float(lot["strike"]))
+            mark = None if row is None else mid(*_side(row, str(lot["right"])))
+        if mark is None:
+            return None
+        value += mark * int(lot["quantity"])
+    return round(value, 4)
 
 
 def _pid() -> str:
