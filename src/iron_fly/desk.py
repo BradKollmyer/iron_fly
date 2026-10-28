@@ -1103,8 +1103,8 @@ def clear_flies(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM leftover_long WHERE player_id = ?", (_pid(),))
     conn.execute("DELETE FROM leftover_roll WHERE player_id = ?", (_pid(),))
     conn.execute("DELETE FROM desk_event WHERE player_id = ?", (_pid(),))
-    conn.execute("DELETE FROM replay_pending_close WHERE player_id = ?", (_pid(),))
     forget_policy(_pid())
+    conn.execute("DELETE FROM replay_pending_close WHERE player_id = ?", (_pid(),))
     conn.execute(
         "UPDATE desk_state SET applied_at = NULL, regime_latch = NULL, open_conflict = NULL WHERE player_id = ?",
         (_pid(),),
