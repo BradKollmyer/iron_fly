@@ -286,6 +286,11 @@ def _report(
             f"  {fly.get('time_open') or '—':<8} {close:<8}  {strike}  wings {_wings_label(fly)}  "
             f"sto {sto}  em {_quote(em):>6}  em% {_quote(pct):>5}  pnl {_dollars(fly.get('pnl'))}"
         )
+    if frame.get("parked_cash_points") or frame.get("parked_value_points"):
+        lines.append(
+            f"Parked wings cash {_dollars(frame.get('parked_cash_points'))} "
+            f"value {_dollars(frame.get('parked_value_points'))}"
+        )
     lines.append(f"P&L {_dollars(frame.get('pnl'))}")
     lines.append("")
     lines.append("Events")
