@@ -38,7 +38,10 @@ def session(tmp_path):
 
 
 @pytest.mark.parametrize("delay, fill_second", [(0, 1), (250, 2), (2000, 3)])
-def test_replay_close_uses_due_ticks_quotes_after_price_recovers(session, monkeypatch, delay, fill_second):
+@pytest.mark.parametrize("use_config", [True, False], ids=["use-config", "manual-auto-drop"])
+def test_replay_close_uses_due_ticks_quotes_after_price_recovers(
+    session, monkeypatch, delay, fill_second, use_config
+):
     conn, settings = session
     desk.apply_spec(
         conn,
@@ -47,7 +50,13 @@ def test_replay_close_uses_due_ticks_quotes_after_price_recovers(session, monkey
             f"fill_mode_open: bid\nfill_mode_close: ask\nclose_fill_ms: {delay}\n"
         ),
     )
-    desk.set_switches(conn, True, True, True)
+    desk.set_switches(conn, use_config, use_config, True)
+    if not use_config:
+        # Auto Drop acts on a clicked fly while the YAML still owns fill pricing.
+        book = desk.load_book(conn)
+        book.open_fly(7700, 18, 50, WHEN)
+        desk.save_book(conn, book)
+        desk._set_applied(conn, WHEN)
     # t=1 breaches the stop. At t=2 SPX recovers; the accepted close still fills.
     spots = (7700, 7720, 7700, 7700)
     tape = [{"time": int(WHEN.timestamp()) + i, "value": spot} for i, spot in enumerate(spots)]
@@ -62,7 +71,7 @@ def test_replay_close_uses_due_ticks_quotes_after_price_recovers(session, monkey
     monkeypatch.setattr(desk, "chain_asof", quotes)
     trigger = WHEN + timedelta(seconds=1)
     desk.replay_until(conn, settings, WHEN.date(), trigger)
-    assert max(requested) <= trigger
+    assert all(at <= trigger for at in requested)
     assert desk.load_book(conn).flies[0].status == ("closed" if delay == 0 else "active")
     conn.commit()
     if delay:
@@ -70,6 +79,7 @@ def test_replay_close_uses_due_ticks_quotes_after_price_recovers(session, monkey
         desk.replay_until(conn, settings, WHEN.date(), WHEN + timedelta(seconds=fill_second))
     fly = desk.load_book(conn).flies[0]
     assert fly.closed_at == WHEN + timedelta(seconds=fill_second)
+    assert requested[-1] == fly.closed_at
     assert fly.close_debit == pytest.approx(21.2 + fill_second)
     assert conn.execute("SELECT COUNT(*) FROM replay_pending_close").fetchone()[0] == 0
 
