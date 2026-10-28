@@ -122,7 +122,8 @@ def test_stop_sells_the_wing_with_a_bid_and_parks_the_dead_one(tmp_path):
     strategy.book.open_fly(7640, 8.30, 20, when.replace(minute=46))
     intent = Intent(IntentKind.CLOSE, "expiration breakeven", {"strike": 7640.0})
     assert _fill_intent(conn, settings, date(2026, 10, 22), strategy, intent, when, 20, chain) is True
-    expected = round(float(short_mark(chain, 7640) or 0) - 1.05, 2)
+    # The default desk closes at ask: 11.50 call + .70 put - 1.05 live wing.
+    expected = 11.15
     assert float(intent.payload["debit"]) == expected
     parked = [(row["right"], int(row["strike"])) for row in leftover_long_rows(conn)]
     assert parked == [("put", 7620)]

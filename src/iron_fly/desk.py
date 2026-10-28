@@ -1890,7 +1890,8 @@ def _buy_shorts_sell_live_wings(
     slippage, the contracts traded, an error code, and the wings that sold.
     """
     sold, parked = live_wing_bids(chain, strike, wings, call_wings)
-    mark = short_mark(chain, strike)
+    _, close_mode = _fill_modes(conn)
+    mark = short_mark(chain, strike, mode=close_mode)
     if mark is None:
         return None, 0, "nomid", []
     rejected = _send_shorts(settings, conn, chain, strike)
