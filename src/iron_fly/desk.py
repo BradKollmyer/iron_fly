@@ -1574,6 +1574,13 @@ def replay_until(conn: sqlite3.Connection, settings: Settings, day: date, until:
     for point in points:
         ts = datetime.fromtimestamp(int(point["time"]), tz=_ET)
         wall = book_clock(ts)
+        # Fill slippage evaluates EM picks from desk_state, just like a clock
+        # pick. Publish this print before any fills, and clear missing readings
+        # so an earlier low EM cannot keep a pick active through a data gap.
+        conn.execute(
+            "UPDATE desk_state SET em_pct = ?, em_now = ? WHERE player_id = ?",
+            (_point_num(point.get("pct")), _point_num(point.get("em")), _pid()),
+        )
         if spec is not None:
             pct = _point_num(point.get("pct"))
             em_value = _point_num(point.get("em"))
